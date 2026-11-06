@@ -17,7 +17,7 @@ use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpeci
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, IsWindowEnabled, SetFocus, VK_ESCAPE,
+    EnableWindow, GetFocus, IsWindowEnabled, SetFocus, VK_ESCAPE,
 };
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -200,18 +200,126 @@ fn font(face: &str, size: i32, bold: bool, dpi: u32) -> HFONT {
     }
 }
 
-impl Ui {
-    fn new(hwnd: HWND, instance: HINSTANCE, icon: HICON) -> Result<Self> {
-        let (sender, receiver) = mpsc::channel();
-        let installed = match platform::open_service(ServiceAccess::QUERY_STATUS) {
-            Ok(_) => true,
-            Err(windows_service::Error::Winapi(e))
-                if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
-            {
-                false
-            }
-            Err(e) => return Err(error("检查 DDNS 服务失败", e)),
+fn edit_line_height(hwnd: HWND) -> Option<i32> {
+    unsafe {
+        let dc = GetDC(hwnd);
+        if dc.is_null() {
+            return None;
+        }
+        let font = SendMessageW(hwnd, WM_GETFONT, 0, 0) as HFONT;
+        let old_font = if font.is_null() {
+            null_mut()
+        } else {
+            SelectObject(dc, font)
         };
+        let mut metrics = TEXTMETRICW::default();
+        let measured = GetTextMetricsW(dc, &mut metrics) != 0;
+        if !old_font.is_null() {
+            SelectObject(dc, old_font);
+        }
+        ReleaseDC(hwnd, dc);
+        measured.then_some(metrics.tmHeight)
+    }
+}
+
+fn paint_edit_frame(hwnd: HWND) {
+    let mut info = WINDOWINFO {
+        cbSize: size_of::<WINDOWINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        if GetWindowInfo(hwnd, &mut info) == 0 {
+            return;
+        }
+        let dc = GetWindowDC(hwnd);
+        if dc.is_null() {
+            return;
+        }
+        let outer = RECT {
+            left: 0,
+            top: 0,
+            right: info.rcWindow.right - info.rcWindow.left,
+            bottom: info.rcWindow.bottom - info.rcWindow.top,
+        };
+        ExcludeClipRect(
+            dc,
+            info.rcClient.left - info.rcWindow.left,
+            info.rcClient.top - info.rcWindow.top,
+            info.rcClient.right - info.rcWindow.left,
+            info.rcClient.bottom - info.rcWindow.top,
+        );
+        FillRect(dc, &outer, GetSysColorBrush(COLOR_WINDOW));
+        let frame = RECT {
+            bottom: outer.bottom - 1,
+            ..outer
+        };
+        let outline = CreateSolidBrush(LINE);
+        FrameRect(dc, &frame, outline);
+        DeleteObject(outline);
+
+        if IsWindowEnabled(hwnd) != 0 {
+            let focused = GetFocus() == hwnd;
+            let thickness = if focused {
+                scale(2, GetDpiForWindow(hwnd)).max(1)
+            } else {
+                1
+            };
+            let underline = RECT {
+                top: frame.bottom - thickness,
+                ..frame
+            };
+            let brush = CreateSolidBrush(if focused { ACCENT } else { rgb(138, 138, 138) });
+            FillRect(dc, &underline, brush);
+            DeleteObject(brush);
+        }
+        ReleaseDC(hwnd, dc);
+    }
+}
+
+unsafe extern "system" fn centered_edit(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    id: usize,
+    _data: usize,
+) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_NCCALCSIZE => {
+                DefSubclassProc(hwnd, msg, wp, lp);
+                // Both forms of WM_NCCALCSIZE start with the new client rectangle.
+                let rect = &mut *(lp as *mut RECT);
+                if let Some(height) = edit_line_height(hwnd) {
+                    let padding = (rect.bottom - rect.top - height).max(0);
+                    rect.top += padding / 2;
+                    rect.bottom -= padding - padding / 2;
+                }
+                0
+            }
+            WM_NCPAINT => {
+                paint_edit_frame(hwnd);
+                0
+            }
+            // Keep the padding clickable as part of the original edit control.
+            WM_NCHITTEST => HTCLIENT as LRESULT,
+            WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE => {
+                let result = DefSubclassProc(hwnd, msg, wp, lp);
+                RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_FRAME);
+                result
+            }
+            WM_NCDESTROY => {
+                RemoveWindowSubclass(hwnd, Some(centered_edit), id);
+                DefSubclassProc(hwnd, msg, wp, lp)
+            }
+            _ => DefSubclassProc(hwnd, msg, wp, lp),
+        }
+    }
+}
+
+impl Ui {
+    fn new(hwnd: HWND, instance: HINSTANCE, icon: HICON, installed: bool) -> Result<Self> {
+        let (sender, receiver) = mpsc::channel();
         let mut app = Self {
             hwnd,
             icon,
@@ -274,6 +382,11 @@ impl Ui {
             };
             if child.is_null() {
                 return Err(last_error("创建界面控件失败"));
+            }
+            if matches!(kind, Edit | Secret)
+                && unsafe { SetWindowSubclass(child, Some(centered_edit), 0, 0) } == 0
+            {
+                return Err("无法设置输入框的垂直对齐。".into());
             }
             app.widgets[id] = child;
         }
@@ -1119,7 +1232,16 @@ pub fn launch(hidden: bool) -> Result<()> {
             );
         }
     }
-    let mut ui = Ui::new(hwnd, instance, icon)?;
+    let installed = match platform::open_service(ServiceAccess::QUERY_STATUS) {
+        Ok(_) => true,
+        Err(windows_service::Error::Winapi(e))
+            if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+        {
+            false
+        }
+        Err(e) => return Err(error("检查 DDNS 服务失败", e)),
+    };
+    let mut ui = Ui::new(hwnd, instance, icon, installed)?;
     ui.add_tray();
     let show = !hidden || !ui.tray_added;
     UI.with(|state| *state.borrow_mut() = Some(ui));
@@ -1160,4 +1282,61 @@ pub fn launch(hidden: bool) -> Result<()> {
         state.borrow_mut().take();
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_edit_lines_are_vertically_centered() {
+        let instance = unsafe { GetModuleHandleW(null()) };
+        let parent = unsafe {
+            CreateWindowExW(
+                0,
+                w!("STATIC"),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                1024,
+                1024,
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            )
+        };
+        assert!(!parent.is_null());
+        let mut ui = Ui::new(parent, instance, null_mut(), false).unwrap();
+        let mut offsets = Vec::new();
+        for dpi in [96, 120, 144, 192] {
+            ui.dpi = dpi;
+            ui.layout();
+            for id in [HOST, TOKEN, SUFFIX] {
+                let edit = ui.widgets[id];
+                text(edit, "Ag");
+                let mut info = WINDOWINFO {
+                    cbSize: size_of::<WINDOWINFO>() as u32,
+                    ..Default::default()
+                };
+                assert_ne!(unsafe { GetWindowInfo(edit, &mut info) }, 0);
+                let position = unsafe { SendMessageW(edit, EM_POSFROMCHAR, 0, 0) };
+                assert_ne!(position, -1);
+                let text_top = info.rcClient.top + (position >> 16) as i16 as i32;
+                let top = text_top - info.rcWindow.top;
+                let bottom = info.rcWindow.bottom - text_top - edit_line_height(edit).unwrap();
+                if top < 0 || bottom < 0 || (top - bottom).abs() > 1 {
+                    offsets.push((dpi, id, top, bottom));
+                }
+            }
+        }
+        unsafe {
+            DestroyWindow(parent);
+        }
+        assert!(
+            offsets.is_empty(),
+            "(DPI, control, top, bottom) = {offsets:?}"
+        );
+    }
 }
