@@ -23,4 +23,16 @@ if command -v codesign >/dev/null 2>&1; then
 	codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
 fi
 
+VERSION=$(/usr/bin/plutil -extract CFBundleShortVersionString raw "$BUNDLE/Info.plist")
+DMG="dist/IPv6 DDNS $VERSION.dmg"
+STAGE=$(mktemp -d "${TMPDIR:-/tmp}/ipv6ddns-dmg.XXXXXX")
+trap 'rm -rf "$STAGE"' EXIT HUP INT TERM
+
+ditto "$APP" "$STAGE/IPv6 DDNS.app"
+ln -s /Applications "$STAGE/Applications"
+
+hdiutil create -quiet -ov -volname "IPv6 DDNS" -fs HFS+ \
+	-srcfolder "$STAGE" -format UDZO "$DMG"
+
 echo "$APP"
+echo "$DMG"

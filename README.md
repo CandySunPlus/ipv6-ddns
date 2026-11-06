@@ -42,14 +42,18 @@
 
 ## 构建 macOS 版
 
-需要 macOS、Xcode Command Line Tools 和 Rust 工具链。界面使用 AppKit；后台 HTTPS 使用 rustls。打包脚本使用 macOS 自带的 `codesign`（用于 ad-hoc 签名）。
+需要 macOS、Xcode Command Line Tools 和 Rust 工具链。界面使用 AppKit；后台 HTTPS 使用 rustls。打包脚本使用 macOS 自带的 `codesign`（用于 ad-hoc 签名）和 `hdiutil`。
 
 ```sh
 ./scripts/package-macos.sh
-open "dist/IPv6 DDNS.app"
+open "dist/IPv6 DDNS 0.1.0.dmg"
 ```
 
-脚本会执行 release 构建、生成 `dist/IPv6 DDNS.app`，并用 ad-hoc 签名。只想要裸可执行文件时：
+脚本会执行 release 构建、生成 `dist/IPv6 DDNS.app` 并用 ad-hoc 签名，再打包出 `dist/IPv6 DDNS <版本>.dmg`。版本号取自 `assets/macos/Info.plist` 的 `CFBundleShortVersionString`。DMG 里是应用本身和指向 `/Applications` 的快捷方式，拖进去即可安装；只包含构建机架构（Apple Silicon 上为 arm64）。
+
+应用使用 ad-hoc 签名且未公证，拷到其他 Mac 首次打开会被 Gatekeeper 拦截：右键点应用选「打开」，或在「系统设置 → 隐私与安全性」中允许。
+
+只想要裸可执行文件时：
 
 ```sh
 cargo test --locked
