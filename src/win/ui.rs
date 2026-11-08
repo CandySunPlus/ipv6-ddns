@@ -23,7 +23,7 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
 
-use super::{Result, error, last_error, network, platform, service, wide};
+use super::{Result, diagnostics, error, last_error, network, platform, service, wide};
 
 const CLASS: *const u16 = w!("IPv6DDNS.NativeWindow.1");
 const TRAY: u32 = WM_APP + 1;
@@ -106,6 +106,19 @@ enum Work {
     Install,
     Uninstall,
     Automatic(bool),
+}
+
+impl Work {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Poll => "poll",
+            Self::Save => "save",
+            Self::Run { .. } => "run",
+            Self::Install => "install",
+            Self::Uninstall => "uninstall",
+            Self::Automatic(_) => "automatic",
+        }
+    }
 }
 
 struct Event(u64, Work, Result<Option<Reply>>);
@@ -403,6 +416,7 @@ impl Ui {
     }
 
     fn layout(&mut self) {
+        let _stage = diagnostics::Stage::enter("layout");
         let dpi = self.dpi;
         let fonts = vec![
             font("Microsoft YaHei UI", 14, false, dpi),
@@ -461,6 +475,8 @@ impl Ui {
     }
 
     fn add_tray(&mut self) {
+        let _stage = diagnostics::Stage::enter("tray-add");
+        diagnostics::record("tray.add.begin");
         let mut data = self.icon_data();
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         data.uCallbackMessage = TRAY;
@@ -474,9 +490,12 @@ impl Ui {
                 Shell_NotifyIconW(NIM_SETVERSION, &data);
             }
         }
+        diagnostics::record(format!("tray.add.end success={}", self.tray_added));
     }
 
     fn show(&mut self) {
+        let _stage = diagnostics::Stage::enter("show");
+        diagnostics::record("window.show.begin");
         unsafe {
             ShowWindow(self.hwnd, SW_RESTORE);
             SetForegroundWindow(self.hwnd);
@@ -485,9 +504,15 @@ impl Ui {
         if self.installed && self.pending.is_none() {
             self.work(Work::Poll, None);
         }
+        diagnostics::record("window.show.end");
     }
 
     fn hide(&mut self) {
+        let _stage = diagnostics::Stage::enter("hide");
+        diagnostics::record(format!(
+            "window.hide.begin tray_available={}",
+            self.tray_added
+        ));
         unsafe {
             if self.tray_added {
                 KillTimer(self.hwnd, 1);
@@ -497,12 +522,16 @@ impl Ui {
                 DestroyWindow(self.hwnd);
             }
         }
+        diagnostics::record("window.hide.end");
     }
 
     fn tray_menu(&mut self) {
+        let _stage = diagnostics::Stage::enter("tray-menu");
+        diagnostics::record("tray.menu.begin");
         let mut point = POINT::default();
         let menu = unsafe { CreatePopupMenu() };
         if menu.is_null() {
+            diagnostics::record("tray.menu.create_failed");
             return;
         }
         unsafe {
@@ -532,10 +561,12 @@ impl Ui {
             self.show();
         }
         if clicked == 2 {
+            diagnostics::record("exit.request reason=tray-menu");
             unsafe {
                 PostMessageW(self.hwnd, EXIT, 0, 0);
             }
         }
+        diagnostics::record(format!("tray.menu.end selection={clicked}"));
     }
 
     fn set_expanded(&mut self, expanded: bool) {
@@ -543,6 +574,7 @@ impl Ui {
             return;
         }
         self.expanded = expanded;
+        diagnostics::record(format!("window.settings expanded={expanded}"));
         let (width, height) = window_size(self.dpi, expanded);
         let mut position = RECT::default();
         let mut monitor = MONITORINFO {
@@ -668,6 +700,12 @@ impl Ui {
         self.sequence += 1;
         let sequence = self.sequence;
         if !matches!(work, Work::Poll) {
+            diagnostics::record(format!(
+                "work.begin kind={} sequence={sequence}",
+                work.name()
+            ));
+        }
+        if !matches!(work, Work::Poll) {
             self.notice = None;
             self.connection_issue = None;
             self.render();
@@ -675,6 +713,7 @@ impl Ui {
         let sender = self.sender.clone();
         let window = self.hwnd as usize;
         thread::spawn(move || {
+            let started = std::time::Instant::now();
             let result = match work {
                 Work::Poll | Work::Save | Work::Run { .. } => {
                     service::client(request.unwrap_or(Request::Status)).map(Some)
@@ -693,6 +732,14 @@ impl Ui {
                 )
                 .map(|()| None),
             };
+            if result.is_err() || started.elapsed().as_secs() >= 5 || !matches!(work, Work::Poll) {
+                diagnostics::record(format!(
+                    "work.end kind={} sequence={sequence} success={} elapsed_ms={}",
+                    work.name(),
+                    result.is_ok(),
+                    started.elapsed().as_millis()
+                ));
+            }
             if sender.send(Event(sequence, work, result)).is_ok() {
                 unsafe {
                     PostMessageW(window as HWND, EVENT, 0, 0);
@@ -702,6 +749,7 @@ impl Ui {
     }
 
     fn receive(&mut self) {
+        let _stage = diagnostics::Stage::enter("receive");
         while let Ok(Event(sequence, work, outcome)) = self.receiver.try_recv() {
             if sequence != self.sequence {
                 continue;
@@ -723,6 +771,7 @@ impl Ui {
                         self.work(Work::Poll, None);
                     }
                     Work::Uninstall => {
+                        diagnostics::record("exit.request reason=uninstalled");
                         self.installed = false;
                         unsafe {
                             MessageBoxW(
@@ -812,6 +861,7 @@ impl Ui {
     }
 
     fn render(&self) {
+        let _stage = diagnostics::Stage::enter("render");
         let (heading, detail, _) = self.state();
         text(self.widgets[STATE], heading);
         let detail = match self.snapshot.address {
@@ -1033,9 +1083,12 @@ fn rounded(dc: HDC, rect: RECT, diameter: i32, fill: u32, outline: u32) {
 
 impl Drop for Ui {
     fn drop(&mut self) {
+        let _stage = diagnostics::Stage::enter("destroy");
+        diagnostics::record("tray.delete.begin");
         unsafe {
             Shell_NotifyIconW(NIM_DELETE, &self.icon_data());
         }
+        diagnostics::record("tray.delete.end");
         for font in &self.fonts {
             unsafe {
                 DeleteObject(*font);
@@ -1066,6 +1119,25 @@ fn local_time(unix: u64) -> String {
 }
 
 unsafe extern "system" fn window(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let _message = diagnostics::Message::enter(msg);
+    // These notifications can arrive inside a nested menu/message loop, while Ui is borrowed.
+    match msg {
+        WM_POWERBROADCAST => {
+            let event = match wp as u32 {
+                PBT_APMSUSPEND => "suspend",
+                PBT_APMRESUMEAUTOMATIC => "resume-automatic",
+                PBT_APMRESUMESUSPEND => "resume-user",
+                PBT_APMRESUMECRITICAL => "resume-critical",
+                _ => "other",
+            };
+            diagnostics::record(format!("power.broadcast event={event} code={wp}"));
+            return 1;
+        }
+        WM_QUERYENDSESSION => diagnostics::record("session.query_end"),
+        WM_ENDSESSION => diagnostics::record(format!("session.end ending={}", wp != 0)),
+        WM_DESTROY => diagnostics::record("window.destroy"),
+        _ => (),
+    }
     if msg == WM_DESTROY {
         unsafe {
             PostQuitMessage(0);
@@ -1152,7 +1224,10 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                 WM_CONTEXTMENU | WM_RBUTTONUP => ui.tray_menu(),
                 _ => (),
             },
-            value if value == ui.taskbar_created => ui.add_tray(),
+            value if value == ui.taskbar_created => {
+                diagnostics::record("shell.taskbar_created");
+                ui.add_tray();
+            }
             _ => return None,
         }
         Some(0)
@@ -1161,6 +1236,14 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
 }
 
 pub fn launch(hidden: bool) -> Result<()> {
+    let result = launch_inner(hidden);
+    // Error text can include user input, so record only the outcome.
+    diagnostics::record(format!("process.exit success={}", result.is_ok()));
+    diagnostics::flush();
+    result
+}
+
+fn launch_inner(hidden: bool) -> Result<()> {
     let mutex = platform::Handle(unsafe { CreateMutexW(null(), 0, w!(r"Local\IPv6DDNS.Tray.1")) });
     let existing = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     if mutex.0.is_null() {
@@ -1184,6 +1267,12 @@ pub fn launch(hidden: bool) -> Result<()> {
         }
         return Ok(());
     }
+    // Only the owning tray instance writes/rotates the log, including during repeated launches.
+    diagnostics::init();
+    diagnostics::record(format!(
+        "process.start version={} hidden={hidden}",
+        env!("CARGO_PKG_VERSION")
+    ));
     let instance = unsafe { GetModuleHandleW(null()) };
     let icon = unsafe { LoadIconW(instance, 101usize as *const u16) };
     let icon = if icon.is_null() {
@@ -1222,6 +1311,8 @@ pub fn launch(hidden: bool) -> Result<()> {
     if hwnd.is_null() {
         return Err(last_error("创建主窗口失败"));
     }
+    let _watchdog = diagnostics::Watchdog::start(hwnd);
+    diagnostics::record("window.created watchdog_started=true");
     for (attribute, color) in [(DWMWA_CAPTION_COLOR, PAPER), (DWMWA_TEXT_COLOR, INK)] {
         unsafe {
             DwmSetWindowAttribute(
@@ -1271,7 +1362,12 @@ pub fn launch(hidden: bool) -> Result<()> {
             }
             continue;
         }
-        if unsafe { IsDialogMessageW(hwnd, &msg) } == 0 {
+        let handled = {
+            let _stage = diagnostics::Stage::enter("keyboard");
+            unsafe { IsDialogMessageW(hwnd, &msg) }
+        };
+        if handled == 0 {
+            let _stage = diagnostics::Stage::enter("dispatch");
             unsafe {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);

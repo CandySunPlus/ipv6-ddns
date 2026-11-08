@@ -1,4 +1,5 @@
 mod cloudflare;
+mod diagnostics;
 mod network;
 mod platform;
 mod service;
