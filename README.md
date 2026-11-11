@@ -167,4 +167,4 @@ cp target/x86_64-pc-windows-gnu/release/ipv6-ddns.exe dist/IPv6-DDNS.exe
 
 ## 界面决策
 
-已确认采用紧凑原生桌面窗口和键盘操作的透明背景 Linux TUI。桌面版的 IPv6 后缀标签与输入框同行垂直居中。交互原型保存在独立分支 `prototype/approved-platform-ui`，不参与正式构建。
+已确认采用紧凑原生桌面窗口和键盘操作的透明背景 Linux TUI。桌面版的 IPv6 后缀标签与输入框同行垂直居中。交互原型保存在归档标签 `archive/approved-platform-ui`，不参与正式构建。
