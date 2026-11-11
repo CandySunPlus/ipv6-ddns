@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IPv6 DDNS · 跨平台界面原型</title>
+  <link rel="stylesheet" href="./shared.css">
+  <link rel="stylesheet" href="./desktop.css">
+</head>
+<body>
+  <!-- Throwaway preview: three structurally distinct variants, ?platform=mac|win|linux&variant=A|B|C. No production route exists in this native Rust app. -->
+  <header class="preview-header">
+    <div><span class="eyebrow">IPv6 DDNS / DESIGN REVIEW</span><h1>一次配置，后台运行。</h1><p>先校验三端界面与操作方式，再实现 Linux 和阿里云支持。</p></div>
+    <span class="prototype-tag">交互原型 · 待你确认</span>
+  </header>
+  <p class="safety">仅模拟：不写入配置、不调用 DNS、不安装或控制服务。请勿输入真实凭据。地址与日志均为示例。</p>
+  <div class="preview-toolbar">
+    <nav aria-label="预览平台" id="platforms"><button data-platform="mac">macOS <small>菜单栏</small></button><button data-platform="win">Windows <small>系统托盘</small></button><button data-platform="linux">Linux <small>TUI + systemd</small></button></nav>
+    <label class="scenario-picker">预览状态 <select id="scenario"><option value="healthy">已配置 · 正常运行</option><option value="unconfigured">首次使用 · 未配置</option><option value="auth-error">凭据 / 权限错误</option><option value="no-ipv6">没有可用公网 IPv6</option><option value="stopped">后台服务已停止</option></select></label>
+  </div>
+  <main class="preview-grid">
+    <section class="preview-stage" aria-label="交互原型"><div id="surface"></div></section>
+    <aside class="review-rail">
+      <div class="rail-label">本方案校验点</div><h2 id="variant-title"></h2><p id="variant-note"></p>
+      <hr><h3 id="platform-title"></h3><p id="platform-note"></p>
+      <ul><li>阿里云 / Cloudflare 凭据字段切换</li><li>保存配置与立即同步分开</li><li>界面退出不影响后台服务</li><li>错误与未保存改动是否清楚</li></ul>
+      <details open><summary>当前原型状态（凭据不展示）</summary><pre id="state" aria-live="polite"></pre></details>
+      <p class="footnote">状态仅保留在当前页面内存；刷新即重置。切换「预览状态」会载入对应演示场景。</p>
+      <p class="footnote">阿里云凭据建议使用有目标域名解析权限的 RAM 用户。<a href="https://www.alibabacloud.com/help/en/dns/api-alidns-2015-01-09-updatedomainrecord" target="_blank" rel="noreferrer">官方权限说明 ↗</a></p>
+    </aside>
+  </main>
+  <nav class="prototype-switcher" aria-label="切换界面方案">
+    <button id="previous" aria-label="上一个方案">←</button>
+    <div><span class="switcher-caption">界面方案</span><strong id="variant-label"></strong></div>
+    <div class="variant-buttons"><button data-variant="A">A</button><button data-variant="B">B</button><button data-variant="C">C</button></div>
+    <button id="next" aria-label="下一个方案">→</button>
+  </nav>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

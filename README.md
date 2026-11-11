@@ -167,4 +167,18 @@ cp target/x86_64-pc-windows-gnu/release/ipv6-ddns.exe dist/IPv6-DDNS.exe
 
 ## 界面决策
 
-已确认采用紧凑原生桌面窗口和键盘操作的透明背景 Linux TUI。桌面版的 IPv6 后缀标签与输入框同行垂直居中。交互原型保存在归档标签 `archive/approved-platform-ui`，不参与正式构建。
+已确认采用紧凑原生桌面窗口和键盘操作的透明背景 Linux TUI。桌面版的 IPv6 后缀标签与输入框同行垂直居中。交互原型统一保留在 `prototypes/`，不参与正式构建；所有操作仅在内存中模拟，不调用 DNS 或控制系统服务，请勿输入真实密钥。
+
+在项目目录运行桌面界面原型：
+
+```sh
+python3 prototypes/preview-ui.py
+```
+
+打开输出的本地地址，可切换 macOS / Windows 和 A、B、C 三种布局；Linux 页面提供真实终端原型的启动命令。
+
+终端原型直接运行：
+
+```sh
+python3 prototypes/tui.py
+```
