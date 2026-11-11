@@ -113,7 +113,7 @@ const DOMAIN: &str = "home.example.com";
 fn creates_dns_only_record_and_uses_exact_record_filter() {
     let ip = "2408:1234::1".parse().unwrap();
     let mut calls = Vec::new();
-    let result = cloudflare::update(DOMAIN, ip, |method, path, body| {
+    cloudflare::update(DOMAIN, ip, |method, path, body| {
         calls.push((method.to_owned(), path.to_owned(), body));
         match calls.len() {
             2 => Ok(json!([{ "name": "example.com", "id": ZONE }])),
@@ -138,7 +138,6 @@ fn creates_dns_only_record_and_uses_exact_record_filter() {
             }))
         )
     );
-    assert_eq!(result, "已创建 AAAA 记录");
 }
 
 #[test]

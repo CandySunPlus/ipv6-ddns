@@ -1,4 +1,3 @@
-mod cloudflare;
 mod network;
 mod platform;
 mod service;

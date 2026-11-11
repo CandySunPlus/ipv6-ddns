@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use ipv6_ddns::{AddressPolicy, Ipv6Suffix, Phase, Reply, Request, Settings, Snapshot};
+use ipv6_ddns::{
+    AddressPolicy, Credentials, Ipv6Suffix, Phase, Provider, Reply, Request, Settings, Snapshot,
+};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
@@ -15,9 +17,9 @@ use objc2_app_kit::{
     NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSApplication,
     NSApplicationActivationOptions, NSApplicationActivationPolicy, NSBackingStoreType, NSButton,
     NSButtonType, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSFont, NSImage,
-    NSLineBreakMode, NSMenu, NSMenuItem, NSRunningApplication, NSSecureTextField, NSStatusBar,
-    NSStatusItem, NSTextField, NSVariableStatusItemLength, NSView, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSLineBreakMode, NSMenu, NSMenuItem, NSPopUpButton, NSRunningApplication, NSSecureTextField,
+    NSStatusBar, NSStatusItem, NSTextField, NSVariableStatusItemLength, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSTimer};
 
@@ -25,7 +27,7 @@ use super::{Result, error, network, platform, service};
 
 const WIDTH: f64 = 486.0;
 const COMPACT_HEIGHT: f64 = 171.0;
-const SETTINGS_HEIGHT: f64 = 512.0;
+const SETTINGS_HEIGHT: f64 = 526.0;
 
 static SHOW: AtomicBool = AtomicBool::new(false);
 
@@ -54,6 +56,12 @@ struct Widgets {
     toggle: Retained<NSButton>,
     run: Retained<NSButton>,
     settings_title: Retained<NSTextField>,
+    provider_label: Retained<NSTextField>,
+    provider: Retained<NSPopUpButton>,
+    access_key_label: Retained<NSTextField>,
+    access_key: Retained<NSTextField>,
+    secret_label: Retained<NSTextField>,
+    secret: Retained<NSSecureTextField>,
     domain_label: Retained<NSTextField>,
     host: Retained<NSTextField>,
     token_label: Retained<NSTextField>,
@@ -71,7 +79,7 @@ struct Widgets {
 enum Work {
     Poll,
     Save,
-    Run { save: bool },
+    Run,
     Install,
     Uninstall,
     Automatic(bool),
@@ -164,8 +172,14 @@ fn checkbox(mtm: MainThreadMarker, title: &str, frame: NSRect) -> Retained<NSBut
 }
 
 fn hide_settings(widgets: &Widgets, expanded: bool, installed: bool) {
-    let views: [&NSView; 11] = [
+    let views: [&NSView; 17] = [
         &widgets.settings_title,
+        &widgets.provider_label,
+        &widgets.provider,
+        &widgets.access_key_label,
+        &widgets.access_key,
+        &widgets.secret_label,
+        &widgets.secret,
         &widgets.domain_label,
         &widgets.host,
         &widgets.token_label,
@@ -181,8 +195,33 @@ fn hide_settings(widgets: &Widgets, expanded: bool, installed: bool) {
         view.setHidden(!expanded);
     }
     widgets.uninstall.setHidden(!expanded || !installed);
+    let aliyun = selected_provider(widgets) == Provider::Aliyun;
+    widgets.token_label.setHidden(!expanded || aliyun);
+    widgets.token.setHidden(!expanded || aliyun);
+    widgets.access_key_label.setHidden(!expanded || !aliyun);
+    widgets.access_key.setHidden(!expanded || !aliyun);
+    widgets.secret_label.setHidden(!expanded || !aliyun);
+    widgets.secret.setHidden(!expanded || !aliyun);
 }
 
+fn selected_provider(widgets: &Widgets) -> Provider {
+    if widgets.provider.indexOfSelectedItem() == 1 {
+        Provider::Aliyun
+    } else {
+        Provider::Cloudflare
+    }
+}
+
+fn secure_field(
+    mtm: MainThreadMarker,
+    frame: NSRect,
+    placeholder: &str,
+) -> Retained<NSSecureTextField> {
+    let field = NSSecureTextField::initWithFrame(NSSecureTextField::alloc(mtm), frame);
+    field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+    field.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+    field
+}
 fn build_widgets(mtm: MainThreadMarker, view: &NSView) -> Widgets {
     let muted = NSColor::secondaryLabelColor();
     let ink = NSColor::labelColor();
@@ -208,53 +247,94 @@ fn build_widgets(mtm: MainThreadMarker, view: &NSView) -> Widgets {
             true,
             &ink,
         ),
+        provider_label: label(
+            mtm,
+            "DNS 服务商",
+            rect(32.0, 216.0, 422.0, 18.0),
+            11.0,
+            false,
+            &ink,
+        ),
+        provider: {
+            let provider = NSPopUpButton::initWithFrame_pullsDown(
+                NSPopUpButton::alloc(mtm),
+                rect(29.0, 237.0, 428.0, 28.0),
+                false,
+            );
+            provider.addItemWithTitle(&NSString::from_str("Cloudflare"));
+            provider.addItemWithTitle(&NSString::from_str("阿里云 DNS"));
+            provider.selectItemAtIndex(0);
+            provider
+        },
+        access_key_label: label(
+            mtm,
+            "AccessKey ID",
+            rect(32.0, 330.0, 422.0, 18.0),
+            11.0,
+            false,
+            &ink,
+        ),
+        access_key: field(
+            mtm,
+            rect(32.0, 351.0, 422.0, 24.0),
+            "输入阿里云 AccessKey ID",
+        ),
+        secret_label: label(
+            mtm,
+            "AccessKey Secret",
+            rect(32.0, 387.0, 422.0, 18.0),
+            11.0,
+            false,
+            &ink,
+        ),
+        secret: secure_field(
+            mtm,
+            rect(32.0, 408.0, 422.0, 24.0),
+            "输入阿里云 AccessKey Secret",
+        ),
         domain_label: label(
             mtm,
             "域名",
-            rect(32.0, 217.0, 422.0, 20.0),
+            rect(32.0, 273.0, 422.0, 18.0),
             11.0,
             false,
             &ink,
         ),
-        host: field(mtm, rect(32.0, 242.0, 422.0, 24.0), "home.example.com"),
+        host: field(mtm, rect(32.0, 294.0, 422.0, 24.0), "home.example.com"),
         token_label: label(
             mtm,
             "Cloudflare API Token",
-            rect(32.0, 283.0, 422.0, 20.0),
+            rect(32.0, 330.0, 422.0, 18.0),
             11.0,
             false,
             &ink,
         ),
-        token: {
-            let token = NSSecureTextField::initWithFrame(
-                NSSecureTextField::alloc(mtm),
-                rect(32.0, 308.0, 422.0, 24.0),
-            );
-            token.setFont(Some(&NSFont::systemFontOfSize(13.0)));
-            token.setPlaceholderString(Some(&NSString::from_str("输入 Cloudflare API Token")));
-            token
-        },
-        filter: checkbox(mtm, "按 IPv6 后缀筛选", rect(32.0, 346.0, 422.0, 25.0)),
+        token: secure_field(
+            mtm,
+            rect(32.0, 351.0, 422.0, 24.0),
+            "输入 Cloudflare API Token",
+        ),
+        filter: checkbox(mtm, "按 IPv6 后缀筛选", rect(32.0, 392.0, 203.0, 25.0)),
         suffix_label: label(
             mtm,
             "IPv6 后缀",
-            rect(32.0, 375.0, 422.0, 19.0),
+            rect(32.0, 421.0, 422.0, 19.0),
             11.0,
             false,
             &ink,
         ),
-        suffix: field(mtm, rect(32.0, 400.0, 422.0, 24.0), "例如 ::8023"),
+        suffix: field(mtm, rect(32.0, 446.0, 422.0, 24.0), "例如 ::8023"),
         hint: label(
             mtm,
             "默认使用稳定的公网 IPv6，跳过临时地址。",
-            rect(32.0, 435.0, 422.0, 21.0),
+            rect(32.0, 481.0, 422.0, 21.0),
             11.0,
             false,
             &muted,
         ),
-        automatic: checkbox(mtm, "开机自动更新", rect(32.0, 461.0, 174.0, 32.0)),
-        uninstall: button(mtm, "卸载服务…", rect(231.0, 461.0, 102.0, 32.0)),
-        save: button(mtm, "保存设置", rect(355.0, 461.0, 99.0, 32.0)),
+        automatic: checkbox(mtm, "开机自动更新", rect(32.0, 521.0, 174.0, 32.0)),
+        uninstall: button(mtm, "卸载服务…", rect(231.0, 521.0, 102.0, 32.0)),
+        save: button(mtm, "保存设置", rect(355.0, 521.0, 99.0, 32.0)),
     };
     if let Some(cell) = widgets.detail.cell() {
         cell.setWraps(true);
@@ -269,6 +349,12 @@ fn build_widgets(mtm: MainThreadMarker, view: &NSView) -> Widgets {
         &widgets.toggle,
         &widgets.run,
         &widgets.settings_title,
+        &widgets.provider_label,
+        &widgets.provider,
+        &widgets.access_key_label,
+        &widgets.access_key,
+        &widgets.secret_label,
+        &widgets.secret,
         &widgets.domain_label,
         &widgets.host,
         &widgets.token_label,
@@ -426,12 +512,11 @@ define_class!(
 
         #[unsafe(method(runNow:))]
         fn run_now(&self, _sender: &AnyObject) {
-            let (installed, initialized, expanded, phase, configured) = {
+            let (installed, initialized, phase, configured) = {
                 let ui = self.ui();
                 (
                     ui.installed,
                     ui.initialized,
-                    ui.expanded,
                     ui.snapshot.phase,
                     ui.snapshot.settings.is_some(),
                 )
@@ -442,16 +527,23 @@ define_class!(
                 return;
             } else if !configured {
                 self.set_expanded(true);
-            } else if expanded {
-                self.save_or_run(true);
             } else {
-                self.work(Work::Run { save: false }, Some(Request::Run));
+                self.work(Work::Run, Some(Request::Run));
             }
         }
 
         #[unsafe(method(saveSettings:))]
         fn save_settings(&self, _sender: &AnyObject) {
-            self.save_or_run(false);
+            self.save();
+        }
+
+        #[unsafe(method(providerChanged:))]
+        fn provider_changed(&self, _sender: &AnyObject) {
+            self.ui().notice = None;
+            if self.ui().expanded {
+                self.resize(true);
+            }
+            self.render();
         }
 
         #[unsafe(method(filterChanged:))]
@@ -477,7 +569,7 @@ define_class!(
                                 | Work::Uninstall
                                 | Work::Automatic(_)
                                 | Work::Save
-                                | Work::Run { .. }
+                                | Work::Run
                         )
                     ),
                 )
@@ -559,6 +651,11 @@ impl Controller {
             WIDTH,
             if expanded {
                 SETTINGS_HEIGHT
+                    + if selected_provider(&self.ivars().widgets) == Provider::Aliyun {
+                        46.0
+                    } else {
+                        0.0
+                    }
             } else {
                 COMPACT_HEIGHT
             },
@@ -579,7 +676,7 @@ impl Controller {
         self.render();
     }
 
-    fn save_or_run(&self, run: bool) {
+    fn save(&self) {
         let domain = match network::domain(&self.ivars().widgets.host.stringValue().to_string()) {
             Ok(domain) => domain,
             Err(message) => return self.reject(message),
@@ -593,24 +690,27 @@ impl Controller {
         } else {
             AddressPolicy::Stable
         };
-        let token = self.ivars().widgets.token.stringValue().to_string();
-        let configured = self.ui().snapshot.settings.is_some();
-        if token.trim().is_empty() && !configured {
-            return self.reject("请输入 Cloudflare API Token。".into());
-        }
-        let request = Request::Save {
-            settings: Settings { domain, address },
-            token,
-            run,
-        };
-        self.work(
-            if run {
-                Work::Run { save: true }
-            } else {
-                Work::Save
+        let widgets = &self.ivars().widgets;
+        let provider = selected_provider(widgets);
+        let credentials = match provider {
+            Provider::Cloudflare => Credentials::Cloudflare {
+                token: widgets.token.stringValue().to_string(),
             },
-            Some(request),
-        );
+            Provider::Aliyun => Credentials::Aliyun {
+                access_key_id: widgets.access_key.stringValue().to_string(),
+                access_key_secret: widgets.secret.stringValue().to_string(),
+            },
+        };
+        let request = Request::Save {
+            settings: Settings {
+                domain,
+                provider,
+                address,
+            },
+            credentials,
+            run: false,
+        };
+        self.work(Work::Save, Some(request));
     }
 
     fn work(&self, work: Work, request: Option<Request>) {
@@ -638,7 +738,7 @@ impl Controller {
         }
         thread::spawn(move || {
             let result = match work {
-                Work::Poll | Work::Save | Work::Run { .. } => {
+                Work::Poll | Work::Save | Work::Run => {
                     service::client(request.unwrap_or(Request::Status)).map(Some)
                 }
                 Work::Install => {
@@ -710,11 +810,16 @@ impl Controller {
 
     fn receive_reply(&self, work: Work, reply: Reply) {
         let widgets = &self.ivars().widgets;
+        let previous_provider = selected_provider(widgets);
         let mut ui = self.ui();
         if !ui.initialized {
             ui.initialized = true;
             if let Some(settings) = &reply.snapshot.settings {
                 text(&widgets.host, &settings.domain);
+                widgets.provider.selectItemAtIndex(match settings.provider {
+                    Provider::Cloudflare => 0,
+                    Provider::Aliyun => 1,
+                });
                 if let AddressPolicy::Suffix(suffix) = &settings.address {
                     ui.filter = true;
                     text(&widgets.suffix, &suffix.to_string());
@@ -723,13 +828,24 @@ impl Controller {
         }
         if let Some(error) = reply.error.clone() {
             ui.notice = Some((true, error));
-        } else if matches!(work, Work::Save | Work::Run { save: true }) {
-            widgets.token.setStringValue(&NSString::from_str(""));
-            ui.notice = matches!(work, Work::Save).then(|| (false, "已保存配置。".into()));
+        } else if matches!(work, Work::Save) {
+            match selected_provider(widgets) {
+                Provider::Cloudflare => widgets.token.setStringValue(&NSString::from_str("")),
+                Provider::Aliyun => {
+                    widgets.access_key.setStringValue(&NSString::from_str(""));
+                    widgets.secret.setStringValue(&NSString::from_str(""));
+                }
+            }
+            ui.notice = Some((false, "已保存配置。点击「立即运行」可同步。".into()));
         } else if ui.snapshot.phase != reply.snapshot.phase {
             ui.notice = None;
         }
         ui.snapshot = reply.snapshot;
+        let resized = ui.expanded && previous_provider != selected_provider(widgets);
+        drop(ui);
+        if resized {
+            self.resize(true);
+        }
     }
 
     fn status(&self) -> (String, String, Tone) {
@@ -771,7 +887,10 @@ impl Controller {
         match ui.snapshot.phase {
             Phase::Idle if ui.snapshot.settings.is_none() => (
                 "等待配置".into(),
-                "打开设置，填写域名和 Cloudflare API Token。".into(),
+                format!(
+                    "打开设置，填写域名和 {} 凭据。",
+                    selected_provider(&self.ivars().widgets).name()
+                ),
                 Tone::Muted,
             ),
             Phase::Idle => (
@@ -781,7 +900,14 @@ impl Controller {
             ),
             Phase::Running => (
                 "正在同步".into(),
-                "正在检查 Cloudflare 中的 AAAA 记录。".into(),
+                format!(
+                    "正在检查 {} 中的 AAAA 记录。",
+                    ui.snapshot
+                        .settings
+                        .as_ref()
+                        .map_or(Provider::default(), |settings| settings.provider)
+                        .name()
+                ),
                 Tone::Accent,
             ),
             Phase::Success => (
@@ -800,7 +926,6 @@ impl Controller {
             address,
             last_run,
             next_run,
-            configured,
             automatic,
             filter,
             expanded,
@@ -812,19 +937,12 @@ impl Controller {
             let ui = self.ui();
             let active = !matches!(
                 ui.pending,
-                Some(
-                    Work::Install
-                        | Work::Uninstall
-                        | Work::Automatic(_)
-                        | Work::Save
-                        | Work::Run { .. }
-                )
+                Some(Work::Install | Work::Uninstall | Work::Automatic(_) | Work::Save | Work::Run)
             );
             (
                 ui.snapshot.address,
                 ui.snapshot.last_run,
                 ui.snapshot.next_run,
-                ui.snapshot.settings.is_some(),
                 ui.snapshot.automatic,
                 ui.filter,
                 ui.expanded,
@@ -853,13 +971,68 @@ impl Controller {
             (None, None) => String::new(),
         };
         text(&widgets.times, &times);
+        let provider = selected_provider(widgets);
+        let saved_provider = self
+            .ui()
+            .snapshot
+            .settings
+            .as_ref()
+            .map(|settings| settings.provider);
+        let same_provider = saved_provider == Some(provider);
+        text(
+            &widgets.badge,
+            &format!("{}  ·  AAAA", saved_provider.unwrap_or(provider).name()),
+        );
         widgets
             .token
-            .setPlaceholderString(Some(&NSString::from_str(if configured {
+            .setPlaceholderString(Some(&NSString::from_str(if same_provider {
                 "已保存，留空继续使用"
             } else {
                 "输入 Cloudflare API Token"
             })));
+        widgets
+            .access_key
+            .setPlaceholderString(Some(&NSString::from_str(if same_provider {
+                "已保存，留空继续使用"
+            } else {
+                "输入阿里云 AccessKey ID"
+            })));
+        widgets
+            .secret
+            .setPlaceholderString(Some(&NSString::from_str(if same_provider {
+                "已保存，留空继续使用"
+            } else {
+                "输入阿里云 AccessKey Secret"
+            })));
+        let offset = if provider == Provider::Aliyun {
+            46.0
+        } else {
+            0.0
+        };
+        widgets
+            .filter
+            .setFrame(rect(32.0, 392.0 + offset, 203.0, 25.0));
+        let suffix_frame = rect(313.0, 391.0 + offset, 141.0, 24.0);
+        let label_height = widgets.suffix_label.intrinsicContentSize().height;
+        widgets.suffix.setFrame(suffix_frame);
+        widgets.suffix_label.setFrame(rect(
+            244.0,
+            suffix_frame.origin.y + (suffix_frame.size.height - label_height) / 2.0,
+            70.0,
+            label_height,
+        ));
+        widgets
+            .hint
+            .setFrame(rect(32.0, 428.0 + offset, 422.0, 21.0));
+        widgets
+            .automatic
+            .setFrame(rect(32.0, 475.0 + offset, 174.0, 32.0));
+        widgets
+            .uninstall
+            .setFrame(rect(231.0, 475.0 + offset, 102.0, 32.0));
+        widgets
+            .save
+            .setFrame(rect(355.0, 475.0 + offset, 99.0, 32.0));
         title(
             &widgets.run,
             if !installed {
@@ -887,10 +1060,14 @@ impl Controller {
             },
         );
         let ready = active && phase != Phase::Running;
-        widgets.host.setEnabled(active);
-        widgets.token.setEnabled(active);
-        widgets.filter.setEnabled(active);
-        widgets.suffix.setEnabled(active && filter);
+        let editable = active && (!installed || initialized);
+        widgets.host.setEnabled(editable);
+        widgets.token.setEnabled(editable);
+        widgets.provider.setEnabled(editable);
+        widgets.access_key.setEnabled(editable);
+        widgets.secret.setEnabled(editable);
+        widgets.filter.setEnabled(editable);
+        widgets.suffix.setEnabled(editable && filter);
         widgets.run.setEnabled(ready && (!installed || initialized));
         widgets.save.setEnabled(installed && initialized && ready);
         widgets.uninstall.setEnabled(installed && active);
@@ -1067,6 +1244,8 @@ fn setup(hidden: bool, lock: File) -> Result<Retained<Controller>> {
         widgets.run.setAction(Some(sel!(runNow:)));
         widgets.save.setTarget(Some(&controller));
         widgets.save.setAction(Some(sel!(saveSettings:)));
+        widgets.provider.setTarget(Some(&controller));
+        widgets.provider.setAction(Some(sel!(providerChanged:)));
         widgets.filter.setTarget(Some(&controller));
         widgets.filter.setAction(Some(sel!(filterChanged:)));
         widgets.automatic.setTarget(Some(&controller));

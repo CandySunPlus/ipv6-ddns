@@ -4,7 +4,12 @@ use std::net::Ipv6Addr;
 
 use serde::{Deserialize, Serialize};
 
+pub mod aliyun;
 pub mod cloudflare;
+mod config;
+pub mod dns;
+
+pub use config::{Config, Credentials, Provider};
 
 pub const INTERVAL: u64 = 300;
 pub const RETRY: u64 = 60;
@@ -145,6 +150,8 @@ pub fn dns_name(name: &str) -> Result<String, &'static str> {
 pub struct Settings {
     pub domain: String,
     #[serde(default)]
+    pub provider: Provider,
+    #[serde(default)]
     pub address: AddressPolicy,
 }
 
@@ -174,7 +181,7 @@ pub enum Request {
     Run,
     Save {
         settings: Settings,
-        token: String,
+        credentials: Credentials,
         run: bool,
     },
 }

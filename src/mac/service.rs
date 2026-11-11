@@ -7,10 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ipv6_ddns::{INTERVAL, Phase, RETRY, Reply, Request, Settings, Snapshot, select_address};
+use ipv6_ddns::{
+    Config, Credentials, INTERVAL, Phase, RETRY, Reply, Request, Settings, Snapshot, select_address,
+};
 
-use super::platform::{self, Config};
-use super::{Result, cloudflare, error, network};
+use super::platform;
+use super::{Result, error, network};
 
 const LIMIT: usize = 16 * 1024;
 type Shared = Arc<Mutex<Engine>>;
@@ -53,36 +55,15 @@ impl Engine {
         Reply { snapshot, error }
     }
 
-    fn save(&mut self, mut settings: Settings, token: String) -> Result<()> {
+    fn save(&mut self, settings: Settings, credentials: Credentials) -> Result<()> {
         if self.snapshot.phase == Phase::Running {
             return Err("正在更新，请稍后再试。".into());
         }
-        settings.domain = network::domain(&settings.domain)?;
-        let token = token.trim();
-        let old = self.config.as_ref();
-        let token = if token.is_empty() {
-            old.map_or("", |c| c.token.as_str())
-        } else {
-            token
-        };
-        if token.is_empty() {
-            return Err("请输入 Cloudflare API Token。".into());
-        }
-        if token.len() > 512
-            || !token
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.~+/=".contains(&b))
-        {
-            return Err("Cloudflare API Token 格式无效。".into());
-        }
-        if old.is_some_and(|c| c.settings == settings && c.token == token) {
+        let config = Config::updated(settings, credentials, self.config.as_ref())?;
+        platform::store(&config)?;
+        if self.config.as_ref() == Some(&config) {
             return Ok(());
         }
-        let config = Config {
-            settings,
-            token: token.to_owned(),
-        };
-        platform::store(&config)?;
         self.config = Some(config);
         self.snapshot.phase = Phase::Idle;
         self.snapshot.message.clear();
@@ -112,9 +93,7 @@ fn start_update(engine: &Shared, state: &mut Engine) {
             select_address(&config.settings.address, &candidates).map_err(str::to_owned)
         });
         let address = current.as_ref().ok().copied();
-        let outcome = current.and_then(|address| {
-            cloudflare::update(&config.settings.domain, address, &config.token)
-        });
+        let outcome = current.and_then(|address| ipv6_ddns::dns::update(&config, address));
         let mut state = engine.lock().unwrap();
         state.snapshot.address = address;
         state.snapshot.last_run = Some(now());
@@ -188,9 +167,9 @@ fn handle(stream: &mut UnixStream, engine: &Shared, owner: u32) -> Result<()> {
             }
             Ok(Request::Save {
                 settings,
-                token,
+                credentials,
                 run,
-            }) => match state.save(settings, token) {
+            }) => match state.save(settings, credentials) {
                 Ok(()) => {
                     if run {
                         start_update(engine, &mut state);

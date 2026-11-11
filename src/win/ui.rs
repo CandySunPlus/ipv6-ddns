@@ -3,7 +3,9 @@ use std::ptr::{null, null_mut};
 use std::sync::mpsc;
 use std::thread;
 
-use ipv6_ddns::{AddressPolicy, Ipv6Suffix, Phase, Reply, Request, Settings, Snapshot};
+use ipv6_ddns::{
+    AddressPolicy, Credentials, Ipv6Suffix, Phase, Provider, Reply, Request, Settings, Snapshot,
+};
 use windows_service::service::ServiceAccess;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::{
@@ -46,7 +48,6 @@ const SUCCESS: u32 = rgb(15, 114, 59);
 const ERROR: u32 = rgb(171, 42, 50);
 const WIDTH: i32 = 486;
 const COMPACT_HEIGHT: i32 = 171;
-const SETTINGS_HEIGHT: i32 = 512;
 
 const STATE: usize = 0;
 const BADGE: usize = 1;
@@ -55,15 +56,24 @@ const TIMES: usize = 3;
 const TOGGLE: usize = 4;
 const RUN: usize = 5;
 const SETTINGS: usize = 6;
-const HOST: usize = 8;
-const TOKEN: usize = 10;
-const FILTER: usize = 11;
-const SUFFIX_LABEL: usize = 12;
-const SUFFIX: usize = 13;
-const HINT: usize = 14;
-const AUTO: usize = 15;
-const UNINSTALL: usize = 16;
-const SAVE: usize = 17;
+const PROVIDER_LABEL: usize = SETTINGS + 1;
+const PROVIDER: usize = PROVIDER_LABEL + 1;
+const HOST_LABEL: usize = PROVIDER + 1;
+const HOST: usize = HOST_LABEL + 1;
+const TOKEN_LABEL: usize = HOST + 1;
+const TOKEN: usize = TOKEN_LABEL + 1;
+const ACCESS_ID_LABEL: usize = TOKEN + 1;
+const ACCESS_ID: usize = ACCESS_ID_LABEL + 1;
+const ACCESS_SECRET_LABEL: usize = ACCESS_ID + 1;
+const ACCESS_SECRET: usize = ACCESS_SECRET_LABEL + 1;
+const FILTER: usize = ACCESS_SECRET + 1;
+const SUFFIX_LABEL: usize = FILTER + 1;
+const SUFFIX: usize = SUFFIX_LABEL + 1;
+const HINT: usize = SUFFIX + 1;
+const AUTO: usize = HINT + 1;
+const UNINSTALL: usize = AUTO + 1;
+const SAVE: usize = UNINSTALL + 1;
+const WIDGET_COUNT: usize = SAVE + 1;
 const ID: usize = 100;
 
 #[derive(Clone, Copy)]
@@ -72,37 +82,59 @@ enum Kind {
     Edit,
     Secret,
     Button,
+    Combo,
     Check,
     Primary,
 }
 use Kind::*;
 
-const WIDGETS: [(Kind, &str, [i32; 4]); 18] = [
-    (Label, "", [75, 27, 250, 26]),
-    (Label, "Cloudflare  ·  AAAA", [325, 31, 127, 19]),
-    (Label, "", [75, 56, 377, 35]),
-    (Label, "", [75, 92, 377, 17]),
-    (Button, "展开设置", [16, 125, 108, 32]),
-    (Primary, "立即运行", [358, 125, 112, 32]),
-    (Label, "同步设置", [32, 184, 422, 24]),
-    (Label, "域名", [32, 217, 422, 20]),
-    (Edit, "", [32, 238, 422, 32]),
-    (Label, "Cloudflare API Token", [32, 283, 422, 20]),
-    (Secret, "", [32, 304, 422, 32]),
-    (Check, "按 IPv6 后缀筛选", [32, 346, 422, 25]),
-    (Label, "IPv6 后缀", [32, 375, 422, 19]),
-    (Edit, "", [32, 396, 422, 31]),
-    (Label, "默认使用稳定的公网 IPv6。", [32, 435, 422, 21]),
-    (Check, "开机自动更新", [32, 461, 174, 32]),
-    (Button, "卸载服务…", [231, 461, 102, 32]),
-    (Button, "保存设置", [355, 461, 99, 32]),
+const WIDGETS: &[(usize, Kind, &str, [i32; 4])] = &[
+    (STATE, Label, "", [75, 27, 250, 26]),
+    (BADGE, Label, "", [325, 31, 127, 19]),
+    (DETAIL, Label, "", [75, 56, 377, 35]),
+    (TIMES, Label, "", [75, 92, 377, 17]),
+    (TOGGLE, Button, "展开设置", [16, 125, 108, 32]),
+    (RUN, Primary, "立即运行", [358, 125, 112, 32]),
+    (SETTINGS, Label, "同步设置", [32, 184, 422, 24]),
+    (PROVIDER_LABEL, Label, "DNS 服务商", [32, 217, 422, 20]),
+    (PROVIDER, Combo, "", [32, 238, 422, 180]),
+    (HOST_LABEL, Label, "域名", [32, 283, 422, 20]),
+    (HOST, Edit, "", [32, 304, 422, 32]),
+    (
+        TOKEN_LABEL,
+        Label,
+        "Cloudflare API Token",
+        [32, 349, 422, 20],
+    ),
+    (TOKEN, Secret, "", [32, 370, 422, 32]),
+    (
+        ACCESS_ID_LABEL,
+        Label,
+        "阿里云 AccessKey ID",
+        [32, 349, 422, 20],
+    ),
+    (ACCESS_ID, Edit, "", [32, 370, 422, 32]),
+    (
+        ACCESS_SECRET_LABEL,
+        Label,
+        "阿里云 AccessKey Secret",
+        [32, 415, 422, 20],
+    ),
+    (ACCESS_SECRET, Secret, "", [32, 436, 422, 32]),
+    (FILTER, Check, "按 IPv6 后缀筛选", [32, 412, 422, 25]),
+    (SUFFIX_LABEL, Label, "IPv6 后缀", [32, 441, 422, 19]),
+    (SUFFIX, Edit, "", [32, 462, 422, 31]),
+    (HINT, Label, "默认使用稳定的公网 IPv6。", [32, 501, 422, 21]),
+    (AUTO, Check, "开机自动更新", [32, 527, 174, 32]),
+    (UNINSTALL, Button, "卸载服务…", [231, 527, 102, 32]),
+    (SAVE, Button, "保存设置", [355, 527, 99, 32]),
 ];
 
 #[derive(Clone, Copy)]
 enum Work {
     Poll,
     Save,
-    Run { save: bool },
+    Run,
     Install,
     Uninstall,
     Automatic(bool),
@@ -113,7 +145,7 @@ struct Event(u64, Work, Result<Option<Reply>>);
 struct Ui {
     hwnd: HWND,
     icon: HICON,
-    widgets: [HWND; WIDGETS.len()],
+    widgets: [HWND; WIDGET_COUNT],
     fonts: Vec<HFONT>,
     brushes: [HBRUSH; 2],
     dpi: u32,
@@ -123,6 +155,8 @@ struct Ui {
     initialized: bool,
     expanded: bool,
     filter: bool,
+    provider: Provider,
+    draft_changed: bool,
     pending: Option<Work>,
     sequence: u64,
     snapshot: Snapshot,
@@ -159,14 +193,18 @@ fn scale(pixels: i32, dpi: u32) -> i32 {
     (pixels * dpi as i32 + 48) / 96
 }
 
-fn window_size(dpi: u32, expanded: bool) -> (i32, i32) {
+fn settings_height(provider: Provider) -> i32 {
+    578 + if provider == Provider::Aliyun { 66 } else { 0 }
+}
+
+fn window_size(dpi: u32, expanded: bool, provider: Provider) -> (i32, i32) {
     let mut rect = RECT {
         left: 0,
         top: 0,
         right: scale(WIDTH, dpi),
         bottom: scale(
             if expanded {
-                SETTINGS_HEIGHT
+                settings_height(provider)
             } else {
                 COMPACT_HEIGHT
             },
@@ -215,7 +253,7 @@ impl Ui {
         let mut app = Self {
             hwnd,
             icon,
-            widgets: [null_mut(); WIDGETS.len()],
+            widgets: [null_mut(); WIDGET_COUNT],
             fonts: Vec::new(),
             brushes: [unsafe { CreateSolidBrush(PAPER) }, unsafe {
                 CreateSolidBrush(CARD)
@@ -227,6 +265,8 @@ impl Ui {
             initialized: false,
             expanded: false,
             filter: false,
+            provider: Provider::default(),
+            draft_changed: false,
             pending: None,
             sequence: 0,
             snapshot: Snapshot::default(),
@@ -235,7 +275,7 @@ impl Ui {
             sender,
             receiver,
         };
-        for (id, &(kind, title, _)) in WIDGETS.iter().enumerate() {
+        for &(id, kind, title, _) in WIDGETS {
             let (class, ex_style, style) = match kind {
                 Label => (
                     w!("STATIC"),
@@ -252,6 +292,11 @@ impl Ui {
                         } else {
                             0
                         },
+                ),
+                Combo => (
+                    w!("COMBOBOX"),
+                    0,
+                    WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32 | CBS_HASSTRINGS as u32,
                 ),
                 Button | Primary => (w!("BUTTON"), 0, WS_TABSTOP | BS_OWNERDRAW as u32),
                 Check => (w!("BUTTON"), 0, WS_TABSTOP | BS_AUTOCHECKBOX as u32),
@@ -280,6 +325,17 @@ impl Ui {
         unsafe {
             SendMessageW(app.widgets[HOST], EM_LIMITTEXT, 253, 0);
             SendMessageW(app.widgets[TOKEN], EM_LIMITTEXT, 512, 0);
+            SendMessageW(app.widgets[ACCESS_ID], EM_LIMITTEXT, 512, 0);
+            SendMessageW(app.widgets[ACCESS_SECRET], EM_LIMITTEXT, 512, 0);
+            for provider in [Provider::Cloudflare, Provider::Aliyun] {
+                SendMessageW(
+                    app.widgets[PROVIDER],
+                    CB_ADDSTRING,
+                    0,
+                    wide(provider.name()).as_ptr() as isize,
+                );
+            }
+            SendMessageW(app.widgets[PROVIDER], CB_SETCURSEL, 0, 0);
             SendMessageW(app.widgets[SUFFIX], EM_LIMITTEXT, 64, 0);
         }
         cue(app.widgets[HOST], "home.example.com");
@@ -299,7 +355,10 @@ impl Ui {
             font("Segoe UI Variable Text", 13, false, dpi),
             font("Consolas", 15, false, dpi),
         ];
-        for (id, &(_, _, [x, y, width, height])) in WIDGETS.iter().enumerate() {
+        for &(id, _, _, [x, mut y, width, height]) in WIDGETS {
+            if self.provider == Provider::Aliyun && id >= FILTER {
+                y += 66;
+            }
             let font_id = match id {
                 STATE => 1,
                 SETTINGS => 2,
@@ -321,7 +380,7 @@ impl Ui {
             }
         }
         let margin = scale(8, dpi) as isize;
-        for id in [HOST, TOKEN, SUFFIX] {
+        for id in [HOST, TOKEN, ACCESS_ID, ACCESS_SECRET, SUFFIX] {
             unsafe {
                 SendMessageW(
                     self.widgets[id],
@@ -426,11 +485,8 @@ impl Ui {
     }
 
     fn set_expanded(&mut self, expanded: bool) {
-        if expanded == self.expanded {
-            return;
-        }
         self.expanded = expanded;
-        let (width, height) = window_size(self.dpi, expanded);
+        let (width, height) = window_size(self.dpi, expanded, self.provider);
         let mut position = RECT::default();
         let mut monitor = MONITORINFO {
             cbSize: size_of::<MONITORINFO>() as u32,
@@ -449,10 +505,6 @@ impl Ui {
                     .min(monitor.rcWork.bottom - height)
                     .max(monitor.rcWork.top);
             }
-            for (id, child) in self.widgets.iter().enumerate().skip(SETTINGS) {
-                let visible = expanded && (id != UNINSTALL || self.installed);
-                ShowWindow(*child, if visible { SW_SHOWNA } else { SW_HIDE });
-            }
             SetWindowPos(
                 self.hwnd,
                 null_mut(),
@@ -469,8 +521,20 @@ impl Ui {
     fn command(&mut self, id: usize) {
         match id {
             TOGGLE => self.set_expanded(!self.expanded),
+            PROVIDER => {
+                let selected = unsafe { SendMessageW(self.widgets[PROVIDER], CB_GETCURSEL, 0, 0) };
+                self.provider = if selected == 1 {
+                    Provider::Aliyun
+                } else {
+                    Provider::Cloudflare
+                };
+                self.draft_changed = true;
+                self.layout();
+                self.set_expanded(self.expanded);
+            }
             FILTER => {
                 self.filter = !self.filter;
+                self.draft_changed = true;
                 self.render();
                 if self.filter {
                     unsafe {
@@ -479,9 +543,9 @@ impl Ui {
                 }
             }
             RUN if !self.installed => self.work(Work::Install, None),
-            RUN if !self.expanded => {
+            RUN => {
                 if self.snapshot.settings.is_some() {
-                    self.work(Work::Run { save: false }, Some(Request::Run));
+                    self.work(Work::Run, Some(Request::Run));
                 } else {
                     self.set_expanded(true);
                     unsafe {
@@ -489,7 +553,7 @@ impl Ui {
                     }
                 }
             }
-            SAVE | RUN => {
+            SAVE => {
                 let domain = match network::domain(&get_text(self.widgets[HOST])) {
                     Ok(value) => value,
                     Err(e) => {
@@ -508,25 +572,25 @@ impl Ui {
                 } else {
                     AddressPolicy::Stable
                 };
-                let token = get_text(self.widgets[TOKEN]);
-                if token.trim().is_empty() && self.snapshot.settings.is_none() {
-                    self.reject("请输入 Cloudflare API Token。".into(), TOKEN);
-                    return;
-                }
-                let run = id == RUN;
-                let request = Request::Save {
-                    settings: Settings { domain, address },
-                    token,
-                    run,
-                };
-                self.work(
-                    if run {
-                        Work::Run { save: true }
-                    } else {
-                        Work::Save
+                let credentials = match self.provider {
+                    Provider::Cloudflare => Credentials::Cloudflare {
+                        token: get_text(self.widgets[TOKEN]),
                     },
-                    Some(request),
-                );
+                    Provider::Aliyun => Credentials::Aliyun {
+                        access_key_id: get_text(self.widgets[ACCESS_ID]),
+                        access_key_secret: get_text(self.widgets[ACCESS_SECRET]),
+                    },
+                };
+                let request = Request::Save {
+                    settings: Settings {
+                        domain,
+                        provider: self.provider,
+                        address,
+                    },
+                    credentials,
+                    run: false,
+                };
+                self.work(Work::Save, Some(request));
             }
             AUTO if self.installed => self.work(Work::Automatic(!self.snapshot.automatic), None),
             UNINSTALL if self.installed => unsafe {
@@ -563,7 +627,7 @@ impl Ui {
         let window = self.hwnd as usize;
         thread::spawn(move || {
             let result = match work {
-                Work::Poll | Work::Save | Work::Run { .. } => {
+                Work::Poll | Work::Save | Work::Run => {
                     service::client(request.unwrap_or(Request::Status)).map(Some)
                 }
                 Work::Install => platform::current_sid()
@@ -635,19 +699,41 @@ impl Ui {
     fn receive_reply(&mut self, work: Work, reply: Reply) {
         if !self.initialized {
             self.initialized = true;
-            if let Some(settings) = &reply.snapshot.settings {
-                text(self.widgets[HOST], &settings.domain);
-                if let AddressPolicy::Suffix(suffix) = &settings.address {
-                    self.filter = true;
-                    text(self.widgets[SUFFIX], &suffix.to_string());
+            if !self.draft_changed {
+                if let Some(settings) = &reply.snapshot.settings {
+                    self.provider = settings.provider;
+                    unsafe {
+                        SendMessageW(
+                            self.widgets[PROVIDER],
+                            CB_SETCURSEL,
+                            usize::from(self.provider == Provider::Aliyun),
+                            0,
+                        );
+                    }
+                    text(self.widgets[HOST], &settings.domain);
+                    if let AddressPolicy::Suffix(suffix) = &settings.address {
+                        self.filter = true;
+                        text(self.widgets[SUFFIX], &suffix.to_string());
+                    }
+                    self.layout();
+                    self.set_expanded(self.expanded);
                 }
             }
         }
         if let Some(error) = reply.error {
             self.notice = Some((true, error));
-        } else if matches!(work, Work::Save | Work::Run { save: true }) {
-            text(self.widgets[TOKEN], "");
-            self.notice = matches!(work, Work::Save).then(|| (false, "已保存配置。".into()));
+        } else if matches!(work, Work::Save) {
+            let fields: &[usize] = match self.provider {
+                Provider::Cloudflare => &[TOKEN],
+                Provider::Aliyun => &[ACCESS_ID, ACCESS_SECRET],
+            };
+            for &id in fields {
+                unsafe {
+                    SetWindowTextW(self.widgets[id], w!(""));
+                }
+            }
+            self.draft_changed = false;
+            self.notice = Some((false, "已保存配置。点击「立即运行」更新。".into()));
         } else if self.snapshot.phase != reply.snapshot.phase {
             self.notice = None;
         }
@@ -682,17 +768,15 @@ impl Ui {
             return ("正在连接服务", "正在读取本机的 DDNS 状态。", ACCENT);
         }
         match self.snapshot.phase {
-            Phase::Idle if self.snapshot.settings.is_none() => (
-                "等待配置",
-                "展开设置，填写域名和 Cloudflare API Token。",
-                MUTED,
-            ),
+            Phase::Idle if self.snapshot.settings.is_none() => {
+                ("等待配置", "展开设置，选择服务商并填写域名和凭据。", MUTED)
+            }
             Phase::Idle => (
                 "等待运行",
                 "配置已保存。点击「立即运行」可手动更新。",
                 MUTED,
             ),
-            Phase::Running => ("正在同步", "正在检查 Cloudflare 中的 AAAA 记录。", ACCENT),
+            Phase::Running => ("正在同步", "正在检查 DNS 服务商中的 AAAA 记录。", ACCENT),
             Phase::Success => ("同步完成", &self.snapshot.message, SUCCESS),
             Phase::Failed => ("同步失败", &self.snapshot.message, ERROR),
         }
@@ -719,24 +803,36 @@ impl Ui {
         text(self.widgets[TIMES], &times);
         let active = !matches!(
             self.pending,
-            Some(
-                Work::Install
-                    | Work::Uninstall
-                    | Work::Automatic(_)
-                    | Work::Save
-                    | Work::Run { .. }
-            )
+            Some(Work::Install | Work::Uninstall | Work::Automatic(_) | Work::Save | Work::Run)
         );
         let ready = active && self.snapshot.phase != Phase::Running;
-        let configured = self.snapshot.settings.is_some();
-        cue(
-            self.widgets[TOKEN],
-            if configured {
-                "已保存，留空继续使用"
-            } else {
-                "输入 Cloudflare API Token"
-            },
+        let saved_provider = self
+            .snapshot
+            .settings
+            .as_ref()
+            .map(|settings| settings.provider);
+        let configured = saved_provider == Some(self.provider);
+        text(
+            self.widgets[BADGE],
+            &format!(
+                "{}  ·  AAAA",
+                saved_provider.unwrap_or(self.provider).name()
+            ),
         );
+        for (id, prompt) in [
+            (TOKEN, "输入 Cloudflare API Token"),
+            (ACCESS_ID, "输入阿里云 AccessKey ID"),
+            (ACCESS_SECRET, "输入阿里云 AccessKey Secret"),
+        ] {
+            cue(
+                self.widgets[id],
+                if configured {
+                    "已保存，留空继续使用"
+                } else {
+                    prompt
+                },
+            );
+        }
         text(
             self.widgets[RUN],
             if !self.installed {
@@ -764,7 +860,25 @@ impl Ui {
             },
         );
         unsafe {
-            for id in [HOST, TOKEN, FILTER] {
+            for (id, child) in self.widgets.iter().enumerate().skip(SETTINGS) {
+                let provider_visible = match id {
+                    TOKEN_LABEL | TOKEN => self.provider == Provider::Cloudflare,
+                    ACCESS_ID_LABEL | ACCESS_ID | ACCESS_SECRET_LABEL | ACCESS_SECRET => {
+                        self.provider == Provider::Aliyun
+                    }
+                    UNINSTALL => self.installed,
+                    _ => true,
+                };
+                ShowWindow(
+                    *child,
+                    if self.expanded && provider_visible {
+                        SW_SHOWNA
+                    } else {
+                        SW_HIDE
+                    },
+                );
+            }
+            for id in [PROVIDER, HOST, TOKEN, ACCESS_ID, ACCESS_SECRET, FILTER] {
                 EnableWindow(self.widgets[id], i32::from(active));
             }
             EnableWindow(self.widgets[SUFFIX], i32::from(active && self.filter));
@@ -835,7 +949,7 @@ impl Ui {
         if self.expanded {
             rounded(
                 dc,
-                bounds(16, 170, 470, 503),
+                bounds(16, 170, 470, settings_height(self.provider) - 9),
                 scale(9, self.dpi),
                 CARD,
                 LINE,
@@ -1001,8 +1115,16 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
         let mut state = state.try_borrow_mut().ok()?;
         let ui = state.as_mut()?;
         match msg {
-            WM_COMMAND if wp as u16 as usize >= ID && (wp >> 16) == 0 => {
-                ui.command(wp as u16 as usize - ID)
+            WM_COMMAND if wp as u16 as usize >= ID => {
+                let id = wp as u16 as usize - ID;
+                let notification = (wp >> 16) as u32;
+                if notification == 0 || (id == PROVIDER && notification == CBN_SELCHANGE) {
+                    ui.command(id);
+                } else if notification == EN_CHANGE
+                    && matches!(id, HOST | TOKEN | ACCESS_ID | ACCESS_SECRET | SUFFIX)
+                {
+                    ui.draft_changed = true;
+                }
             }
             WM_PAINT => ui.paint(),
             WM_ERASEBKGND => return Some(1),
@@ -1015,7 +1137,7 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
             WM_DPICHANGED => {
                 ui.dpi = wp as u16 as u32;
                 let position = unsafe { &*(lp as *const RECT) };
-                let (width, height) = window_size(ui.dpi, ui.expanded);
+                let (width, height) = window_size(ui.dpi, ui.expanded, ui.provider);
                 unsafe {
                     SetWindowPos(
                         hwnd,
@@ -1089,7 +1211,11 @@ pub fn launch(hidden: bool) -> Result<()> {
     if unsafe { RegisterClassW(&wc) } == 0 {
         return Err(last_error("注册窗口失败"));
     }
-    let (width, height) = window_size(unsafe { GetDpiForSystem() }.max(96), false);
+    let (width, height) = window_size(
+        unsafe { GetDpiForSystem() }.max(96),
+        false,
+        Provider::default(),
+    );
     let hwnd = unsafe {
         CreateWindowExW(
             0,

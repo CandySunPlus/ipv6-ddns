@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use ipv6_ddns::Config;
 use windows_service::service::{
     Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl,
     ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceSidType,
@@ -244,12 +244,6 @@ pub fn owner_sid() -> Result<String> {
     Ok(sid)
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Config {
-    pub settings: ipv6_ddns::Settings,
-    pub token: String,
-}
-
 fn crypt(bytes: &[u8], protect: bool) -> Result<Vec<u8>> {
     let input = CRYPT_INTEGER_BLOB {
         cbData: bytes.len() as u32,
@@ -461,7 +455,7 @@ fn configure_install(service: &Service, owner: &str) -> Result<()> {
         return Err(last_error("设置服务访问权限失败"));
     }
     service
-        .set_description("Keeps a Cloudflare AAAA record synchronized with a Windows IPv6 address.")
+        .set_description("Keeps a DNS AAAA record synchronized with a Windows IPv6 address.")
         .map_err(|e| error("设置服务说明失败", e))?;
     service
         .update_failure_actions(ServiceFailureActions {

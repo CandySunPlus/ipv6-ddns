@@ -8,6 +8,10 @@ mod win;
 #[path = "mac/mod.rs"]
 mod mac;
 
+#[cfg(target_os = "linux")]
+#[path = "linux/mod.rs"]
+mod linux;
+
 #[cfg(windows)]
 fn main() {
     win::main();
@@ -18,7 +22,13 @@ fn main() {
     mac::main();
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
 fn main() {
-    eprintln!("IPv6 DDNS runs on Windows and macOS.");
+    linux::main();
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn main() {
+    eprintln!("IPv6 DDNS supports Linux, Windows and macOS.");
+    std::process::exit(1);
 }

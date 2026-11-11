@@ -3,7 +3,10 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ipv6_ddns::{INTERVAL, Phase, RETRY, Reply, Request, Settings, Snapshot, select_address};
+use ipv6_ddns::{
+    Config, Credentials, INTERVAL, Phase, RETRY, Reply, Request, Settings, Snapshot, dns,
+    select_address,
+};
 use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState,
     ServiceStatus, ServiceType,
@@ -16,8 +19,8 @@ use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::Pipes::*;
 use windows_sys::w;
 
-use super::platform::{self, Config, Handle};
-use super::{NAME, Result, cloudflare, error, last_error, network};
+use super::platform::{self, Handle};
+use super::{NAME, Result, error, last_error, network};
 
 const PIPE: *const u16 = w!(r"\\.\pipe\IPv6DDNS.v2");
 // File read/write permissions without FILE_CREATE_PIPE_INSTANCE (FILE_APPEND_DATA).
@@ -57,36 +60,15 @@ impl Engine {
         Reply { snapshot, error }
     }
 
-    fn save(&mut self, mut settings: Settings, token: String) -> Result<()> {
+    fn save(&mut self, settings: Settings, credentials: Credentials) -> Result<()> {
         if self.snapshot.phase == Phase::Running {
             return Err("正在更新，请稍后再试。".into());
         }
-        settings.domain = network::domain(&settings.domain)?;
-        let token = token.trim();
-        let old = self.config.as_ref();
-        let token = if token.is_empty() {
-            old.map_or("", |c| c.token.as_str())
-        } else {
-            token
-        };
-        if token.is_empty() {
-            return Err("请输入 Cloudflare API Token。".into());
-        }
-        if token.len() > 512
-            || !token
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.~+/=".contains(&b))
-        {
-            return Err("Cloudflare API Token 格式无效。".into());
-        }
-        if old.is_some_and(|c| c.settings == settings && c.token == token) {
+        let config = Config::updated(settings, credentials, self.config.as_ref())?;
+        platform::store(&config)?;
+        if self.config.as_ref() == Some(&config) {
             return Ok(());
         }
-        let config = Config {
-            settings,
-            token: token.to_owned(),
-        };
-        platform::store(&config)?;
         self.config = Some(config);
         self.snapshot.phase = Phase::Idle;
         self.snapshot.message.clear();
@@ -116,9 +98,7 @@ fn start_update(engine: &Shared, state: &mut Engine) {
             select_address(&config.settings.address, &candidates).map_err(str::to_owned)
         });
         let address = current.as_ref().ok().copied();
-        let outcome = current.and_then(|address| {
-            cloudflare::update(&config.settings.domain, address, &config.token)
-        });
+        let outcome = current.and_then(|address| dns::update(&config, address));
         let mut state = engine.lock().unwrap();
         state.snapshot.address = address;
         state.snapshot.last_run = Some(now());
@@ -226,9 +206,9 @@ fn serve(pipe: Handle, engine: Shared) {
                         }
                         Ok(Request::Save {
                             settings,
-                            token,
+                            credentials,
                             run,
-                        }) => match state.save(settings, token) {
+                        }) => match state.save(settings, credentials) {
                             Ok(()) => {
                                 if run {
                                     start_update(&engine, &mut state);

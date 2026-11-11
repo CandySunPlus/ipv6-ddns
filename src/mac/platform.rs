@@ -10,7 +10,7 @@ use std::process::Command;
 use std::ptr::null_mut;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use ipv6_ddns::Config;
 
 use super::{Result, error};
 
@@ -22,12 +22,6 @@ pub const PLIST: &str = "/Library/LaunchDaemons/com.ipv6ddns.daemon.plist";
 const DIRECTORY: &str = "/Library/Application Support/IPv6DDNS";
 const CONFIG: &str = "/Library/Application Support/IPv6DDNS/config.json";
 const OWNER: &str = "/Library/Application Support/IPv6DDNS/owner";
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Config {
-    pub settings: ipv6_ddns::Settings,
-    pub token: String,
-}
 
 pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
