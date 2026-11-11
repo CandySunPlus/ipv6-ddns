@@ -19,13 +19,13 @@ use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpeci
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, IsWindowEnabled, SetFocus, VK_ESCAPE,
+    EnableWindow, GetFocus, IsWindowEnabled, SetFocus, VK_ESCAPE,
 };
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
 
-use super::{Result, error, last_error, network, platform, service, wide};
+use super::{Result, diagnostics, error, last_error, network, platform, service, wide};
 
 const CLASS: *const u16 = w!("IPv6DDNS.NativeWindow.1");
 const TRAY: u32 = WM_APP + 1;
@@ -140,6 +140,19 @@ enum Work {
     Automatic(bool),
 }
 
+impl Work {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Poll => "poll",
+            Self::Save => "save",
+            Self::Run => "run",
+            Self::Install => "install",
+            Self::Uninstall => "uninstall",
+            Self::Automatic(_) => "automatic",
+        }
+    }
+}
+
 struct Event(u64, Work, Result<Option<Reply>>);
 
 struct Ui {
@@ -238,18 +251,126 @@ fn font(face: &str, size: i32, bold: bool, dpi: u32) -> HFONT {
     }
 }
 
-impl Ui {
-    fn new(hwnd: HWND, instance: HINSTANCE, icon: HICON) -> Result<Self> {
-        let (sender, receiver) = mpsc::channel();
-        let installed = match platform::open_service(ServiceAccess::QUERY_STATUS) {
-            Ok(_) => true,
-            Err(windows_service::Error::Winapi(e))
-                if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
-            {
-                false
-            }
-            Err(e) => return Err(error("检查 DDNS 服务失败", e)),
+fn edit_line_height(hwnd: HWND) -> Option<i32> {
+    unsafe {
+        let dc = GetDC(hwnd);
+        if dc.is_null() {
+            return None;
+        }
+        let font = SendMessageW(hwnd, WM_GETFONT, 0, 0) as HFONT;
+        let old_font = if font.is_null() {
+            null_mut()
+        } else {
+            SelectObject(dc, font)
         };
+        let mut metrics = TEXTMETRICW::default();
+        let measured = GetTextMetricsW(dc, &mut metrics) != 0;
+        if !old_font.is_null() {
+            SelectObject(dc, old_font);
+        }
+        ReleaseDC(hwnd, dc);
+        measured.then_some(metrics.tmHeight)
+    }
+}
+
+fn paint_edit_frame(hwnd: HWND) {
+    let mut info = WINDOWINFO {
+        cbSize: size_of::<WINDOWINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        if GetWindowInfo(hwnd, &mut info) == 0 {
+            return;
+        }
+        let dc = GetWindowDC(hwnd);
+        if dc.is_null() {
+            return;
+        }
+        let outer = RECT {
+            left: 0,
+            top: 0,
+            right: info.rcWindow.right - info.rcWindow.left,
+            bottom: info.rcWindow.bottom - info.rcWindow.top,
+        };
+        ExcludeClipRect(
+            dc,
+            info.rcClient.left - info.rcWindow.left,
+            info.rcClient.top - info.rcWindow.top,
+            info.rcClient.right - info.rcWindow.left,
+            info.rcClient.bottom - info.rcWindow.top,
+        );
+        FillRect(dc, &outer, GetSysColorBrush(COLOR_WINDOW));
+        let frame = RECT {
+            bottom: outer.bottom - 1,
+            ..outer
+        };
+        let outline = CreateSolidBrush(LINE);
+        FrameRect(dc, &frame, outline);
+        DeleteObject(outline);
+
+        if IsWindowEnabled(hwnd) != 0 {
+            let focused = GetFocus() == hwnd;
+            let thickness = if focused {
+                scale(2, GetDpiForWindow(hwnd)).max(1)
+            } else {
+                1
+            };
+            let underline = RECT {
+                top: frame.bottom - thickness,
+                ..frame
+            };
+            let brush = CreateSolidBrush(if focused { ACCENT } else { rgb(138, 138, 138) });
+            FillRect(dc, &underline, brush);
+            DeleteObject(brush);
+        }
+        ReleaseDC(hwnd, dc);
+    }
+}
+
+unsafe extern "system" fn centered_edit(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    id: usize,
+    _data: usize,
+) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_NCCALCSIZE => {
+                DefSubclassProc(hwnd, msg, wp, lp);
+                // Both forms of WM_NCCALCSIZE start with the new client rectangle.
+                let rect = &mut *(lp as *mut RECT);
+                if let Some(height) = edit_line_height(hwnd) {
+                    let padding = (rect.bottom - rect.top - height).max(0);
+                    rect.top += padding / 2;
+                    rect.bottom -= padding - padding / 2;
+                }
+                0
+            }
+            WM_NCPAINT => {
+                paint_edit_frame(hwnd);
+                0
+            }
+            // Keep the padding clickable as part of the original edit control.
+            WM_NCHITTEST => HTCLIENT as LRESULT,
+            WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE => {
+                let result = DefSubclassProc(hwnd, msg, wp, lp);
+                RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_FRAME);
+                result
+            }
+            WM_NCDESTROY => {
+                RemoveWindowSubclass(hwnd, Some(centered_edit), id);
+                DefSubclassProc(hwnd, msg, wp, lp)
+            }
+            _ => DefSubclassProc(hwnd, msg, wp, lp),
+        }
+    }
+}
+
+impl Ui {
+    fn new(hwnd: HWND, instance: HINSTANCE, icon: HICON, installed: bool) -> Result<Self> {
+        let (sender, receiver) = mpsc::channel();
         let mut app = Self {
             hwnd,
             icon,
@@ -320,6 +441,11 @@ impl Ui {
             if child.is_null() {
                 return Err(last_error("创建界面控件失败"));
             }
+            if matches!(kind, Edit | Secret)
+                && unsafe { SetWindowSubclass(child, Some(centered_edit), 0, 0) } == 0
+            {
+                return Err("无法设置输入框的垂直对齐。".into());
+            }
             app.widgets[id] = child;
         }
         unsafe {
@@ -346,6 +472,7 @@ impl Ui {
     }
 
     fn layout(&mut self) {
+        let _stage = diagnostics::Stage::enter("layout");
         let dpi = self.dpi;
         let fonts = vec![
             font("Microsoft YaHei UI", 14, false, dpi),
@@ -407,6 +534,8 @@ impl Ui {
     }
 
     fn add_tray(&mut self) {
+        let _stage = diagnostics::Stage::enter("tray-add");
+        diagnostics::record("tray.add.begin");
         let mut data = self.icon_data();
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         data.uCallbackMessage = TRAY;
@@ -420,9 +549,12 @@ impl Ui {
                 Shell_NotifyIconW(NIM_SETVERSION, &data);
             }
         }
+        diagnostics::record(format!("tray.add.end success={}", self.tray_added));
     }
 
     fn show(&mut self) {
+        let _stage = diagnostics::Stage::enter("show");
+        diagnostics::record("window.show.begin");
         unsafe {
             ShowWindow(self.hwnd, SW_RESTORE);
             SetForegroundWindow(self.hwnd);
@@ -431,9 +563,15 @@ impl Ui {
         if self.installed && self.pending.is_none() {
             self.work(Work::Poll, None);
         }
+        diagnostics::record("window.show.end");
     }
 
     fn hide(&mut self) {
+        let _stage = diagnostics::Stage::enter("hide");
+        diagnostics::record(format!(
+            "window.hide.begin tray_available={}",
+            self.tray_added
+        ));
         unsafe {
             if self.tray_added {
                 KillTimer(self.hwnd, 1);
@@ -443,12 +581,16 @@ impl Ui {
                 DestroyWindow(self.hwnd);
             }
         }
+        diagnostics::record("window.hide.end");
     }
 
     fn tray_menu(&mut self) {
+        let _stage = diagnostics::Stage::enter("tray-menu");
+        diagnostics::record("tray.menu.begin");
         let mut point = POINT::default();
         let menu = unsafe { CreatePopupMenu() };
         if menu.is_null() {
+            diagnostics::record("tray.menu.create_failed");
             return;
         }
         unsafe {
@@ -478,14 +620,17 @@ impl Ui {
             self.show();
         }
         if clicked == 2 {
+            diagnostics::record("exit.request reason=tray-menu");
             unsafe {
                 PostMessageW(self.hwnd, EXIT, 0, 0);
             }
         }
+        diagnostics::record(format!("tray.menu.end selection={clicked}"));
     }
 
     fn set_expanded(&mut self, expanded: bool) {
         self.expanded = expanded;
+        diagnostics::record(format!("window.settings expanded={expanded}"));
         let (width, height) = window_size(self.dpi, expanded, self.provider);
         let mut position = RECT::default();
         let mut monitor = MONITORINFO {
@@ -619,6 +764,12 @@ impl Ui {
         self.sequence += 1;
         let sequence = self.sequence;
         if !matches!(work, Work::Poll) {
+            diagnostics::record(format!(
+                "work.begin kind={} sequence={sequence}",
+                work.name()
+            ));
+        }
+        if !matches!(work, Work::Poll) {
             self.notice = None;
             self.connection_issue = None;
             self.render();
@@ -626,6 +777,7 @@ impl Ui {
         let sender = self.sender.clone();
         let window = self.hwnd as usize;
         thread::spawn(move || {
+            let started = std::time::Instant::now();
             let result = match work {
                 Work::Poll | Work::Save | Work::Run => {
                     service::client(request.unwrap_or(Request::Status)).map(Some)
@@ -644,6 +796,14 @@ impl Ui {
                 )
                 .map(|()| None),
             };
+            if result.is_err() || started.elapsed().as_secs() >= 5 || !matches!(work, Work::Poll) {
+                diagnostics::record(format!(
+                    "work.end kind={} sequence={sequence} success={} elapsed_ms={}",
+                    work.name(),
+                    result.is_ok(),
+                    started.elapsed().as_millis()
+                ));
+            }
             if sender.send(Event(sequence, work, result)).is_ok() {
                 unsafe {
                     PostMessageW(window as HWND, EVENT, 0, 0);
@@ -653,6 +813,7 @@ impl Ui {
     }
 
     fn receive(&mut self) {
+        let _stage = diagnostics::Stage::enter("receive");
         while let Ok(Event(sequence, work, outcome)) = self.receiver.try_recv() {
             if sequence != self.sequence {
                 continue;
@@ -674,6 +835,7 @@ impl Ui {
                         self.work(Work::Poll, None);
                     }
                     Work::Uninstall => {
+                        diagnostics::record("exit.request reason=uninstalled");
                         self.installed = false;
                         unsafe {
                             MessageBoxW(
@@ -783,6 +945,7 @@ impl Ui {
     }
 
     fn render(&self) {
+        let _stage = diagnostics::Stage::enter("render");
         let (heading, detail, _) = self.state();
         text(self.widgets[STATE], heading);
         let detail = match self.snapshot.address {
@@ -1034,9 +1197,12 @@ fn rounded(dc: HDC, rect: RECT, diameter: i32, fill: u32, outline: u32) {
 
 impl Drop for Ui {
     fn drop(&mut self) {
+        let _stage = diagnostics::Stage::enter("destroy");
+        diagnostics::record("tray.delete.begin");
         unsafe {
             Shell_NotifyIconW(NIM_DELETE, &self.icon_data());
         }
+        diagnostics::record("tray.delete.end");
         for font in &self.fonts {
             unsafe {
                 DeleteObject(*font);
@@ -1067,6 +1233,25 @@ fn local_time(unix: u64) -> String {
 }
 
 unsafe extern "system" fn window(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let _message = diagnostics::Message::enter(msg);
+    // These notifications can arrive inside a nested menu/message loop, while Ui is borrowed.
+    match msg {
+        WM_POWERBROADCAST => {
+            let event = match wp as u32 {
+                PBT_APMSUSPEND => "suspend",
+                PBT_APMRESUMEAUTOMATIC => "resume-automatic",
+                PBT_APMRESUMESUSPEND => "resume-user",
+                PBT_APMRESUMECRITICAL => "resume-critical",
+                _ => "other",
+            };
+            diagnostics::record(format!("power.broadcast event={event} code={wp}"));
+            return 1;
+        }
+        WM_QUERYENDSESSION => diagnostics::record("session.query_end"),
+        WM_ENDSESSION => diagnostics::record(format!("session.end ending={}", wp != 0)),
+        WM_DESTROY => diagnostics::record("window.destroy"),
+        _ => (),
+    }
     if msg == WM_DESTROY {
         unsafe {
             PostQuitMessage(0);
@@ -1161,7 +1346,10 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                 WM_CONTEXTMENU | WM_RBUTTONUP => ui.tray_menu(),
                 _ => (),
             },
-            value if value == ui.taskbar_created => ui.add_tray(),
+            value if value == ui.taskbar_created => {
+                diagnostics::record("shell.taskbar_created");
+                ui.add_tray();
+            }
             _ => return None,
         }
         Some(0)
@@ -1170,6 +1358,14 @@ unsafe extern "system" fn window(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
 }
 
 pub fn launch(hidden: bool) -> Result<()> {
+    let result = launch_inner(hidden);
+    // Error text can include user input, so record only the outcome.
+    diagnostics::record(format!("process.exit success={}", result.is_ok()));
+    diagnostics::flush();
+    result
+}
+
+fn launch_inner(hidden: bool) -> Result<()> {
     let mutex = platform::Handle(unsafe { CreateMutexW(null(), 0, w!(r"Local\IPv6DDNS.Tray.1")) });
     let existing = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     if mutex.0.is_null() {
@@ -1193,6 +1389,12 @@ pub fn launch(hidden: bool) -> Result<()> {
         }
         return Ok(());
     }
+    // Only the owning tray instance writes/rotates the log, including during repeated launches.
+    diagnostics::init();
+    diagnostics::record(format!(
+        "process.start version={} hidden={hidden}",
+        env!("CARGO_PKG_VERSION")
+    ));
     let instance = unsafe { GetModuleHandleW(null()) };
     let icon = unsafe { LoadIconW(instance, 101usize as *const u16) };
     let icon = if icon.is_null() {
@@ -1235,6 +1437,8 @@ pub fn launch(hidden: bool) -> Result<()> {
     if hwnd.is_null() {
         return Err(last_error("创建主窗口失败"));
     }
+    let _watchdog = diagnostics::Watchdog::start(hwnd);
+    diagnostics::record("window.created watchdog_started=true");
     for (attribute, color) in [(DWMWA_CAPTION_COLOR, PAPER), (DWMWA_TEXT_COLOR, INK)] {
         unsafe {
             DwmSetWindowAttribute(
@@ -1245,7 +1449,16 @@ pub fn launch(hidden: bool) -> Result<()> {
             );
         }
     }
-    let mut ui = Ui::new(hwnd, instance, icon)?;
+    let installed = match platform::open_service(ServiceAccess::QUERY_STATUS) {
+        Ok(_) => true,
+        Err(windows_service::Error::Winapi(e))
+            if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+        {
+            false
+        }
+        Err(e) => return Err(error("检查 DDNS 服务失败", e)),
+    };
+    let mut ui = Ui::new(hwnd, instance, icon, installed)?;
     ui.add_tray();
     let show = !hidden || !ui.tray_added;
     UI.with(|state| *state.borrow_mut() = Some(ui));
@@ -1275,7 +1488,12 @@ pub fn launch(hidden: bool) -> Result<()> {
             }
             continue;
         }
-        if unsafe { IsDialogMessageW(hwnd, &msg) } == 0 {
+        let handled = {
+            let _stage = diagnostics::Stage::enter("keyboard");
+            unsafe { IsDialogMessageW(hwnd, &msg) }
+        };
+        if handled == 0 {
+            let _stage = diagnostics::Stage::enter("dispatch");
             unsafe {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -1286,4 +1504,61 @@ pub fn launch(hidden: bool) -> Result<()> {
         state.borrow_mut().take();
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_edit_lines_are_vertically_centered() {
+        let instance = unsafe { GetModuleHandleW(null()) };
+        let parent = unsafe {
+            CreateWindowExW(
+                0,
+                w!("STATIC"),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                1024,
+                1024,
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            )
+        };
+        assert!(!parent.is_null());
+        let mut ui = Ui::new(parent, instance, null_mut(), false).unwrap();
+        let mut offsets = Vec::new();
+        for dpi in [96, 120, 144, 192] {
+            ui.dpi = dpi;
+            ui.layout();
+            for id in [HOST, TOKEN, ACCESS_ID, ACCESS_SECRET, SUFFIX] {
+                let edit = ui.widgets[id];
+                text(edit, "Ag");
+                let mut info = WINDOWINFO {
+                    cbSize: size_of::<WINDOWINFO>() as u32,
+                    ..Default::default()
+                };
+                assert_ne!(unsafe { GetWindowInfo(edit, &mut info) }, 0);
+                let position = unsafe { SendMessageW(edit, EM_POSFROMCHAR, 0, 0) };
+                assert_ne!(position, -1);
+                let text_top = info.rcClient.top + (position >> 16) as i16 as i32;
+                let top = text_top - info.rcWindow.top;
+                let bottom = info.rcWindow.bottom - text_top - edit_line_height(edit).unwrap();
+                if top < 0 || bottom < 0 || (top - bottom).abs() > 1 {
+                    offsets.push((dpi, id, top, bottom));
+                }
+            }
+        }
+        unsafe {
+            DestroyWindow(parent);
+        }
+        assert!(
+            offsets.is_empty(),
+            "(DPI, control, top, bottom) = {offsets:?}"
+        );
+    }
 }
