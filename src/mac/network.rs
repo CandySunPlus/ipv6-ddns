@@ -1,11 +1,18 @@
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::mem::size_of;
 use std::net::Ipv6Addr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr::null_mut;
+use std::{io, iter};
 
 use ipv6_ddns::{AddressKind, Candidate, public_v6};
 
 use super::{Result, error};
+
+#[path = "source_preference.rs"]
+mod source_preference;
+
+pub(super) use source_preference::SourcePreference;
 
 const IN6_IFF_ANYCAST: c_int = 0x0001;
 const IN6_IFF_TENTATIVE: c_int = 0x0002;
@@ -17,12 +24,34 @@ const IN6_IFF_TEMPORARY: c_int = 0x0080;
 const IN6_IFF_DYNAMIC: c_int = 0x0100;
 const IN6_IFF_OPTIMISTIC: c_int = 0x0200;
 
+const UNUSABLE: c_int = IN6_IFF_ANYCAST
+    | IN6_IFF_TENTATIVE
+    | IN6_IFF_DUPLICATED
+    | IN6_IFF_DETACHED
+    | IN6_IFF_OPTIMISTIC;
+
 const SIOCGIFALIFETIME_IN6: libc::c_ulong = 0xc000_0000
     | ((size_of::<libc::in6_ifreq>() as libc::c_ulong & 0x1fff) << 16)
     | (('i' as libc::c_ulong) << 8)
     | 81;
 
 struct IfAddrs(*mut libc::ifaddrs);
+
+impl IfAddrs {
+    fn read() -> io::Result<Self> {
+        let mut raw = null_mut();
+        if unsafe { libc::getifaddrs(&mut raw) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(raw))
+    }
+
+    fn entries(&self) -> impl Iterator<Item = &libc::ifaddrs> {
+        iter::successors(unsafe { self.0.as_ref() }, |item| unsafe {
+            item.ifa_next.as_ref()
+        })
+    }
+}
 
 impl Drop for IfAddrs {
     fn drop(&mut self) {
@@ -37,6 +66,28 @@ fn name_of(entry: &libc::ifaddrs) -> &[u8] {
         return &[];
     }
     unsafe { std::ffi::CStr::from_ptr(entry.ifa_name).to_bytes() }
+}
+
+fn ipv6_of(entry: &libc::ifaddrs) -> Option<&libc::sockaddr_in6> {
+    let address = unsafe { entry.ifa_addr.as_ref()? };
+    (address.sa_family as c_int == libc::AF_INET6)
+        .then(|| unsafe { &*entry.ifa_addr.cast::<libc::sockaddr_in6>() })
+}
+
+fn ipv6_socket() -> io::Result<OwnedFd> {
+    let socket = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+    if socket < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(socket) })
+}
+
+fn interface_name(name: &[u8]) -> [c_char; libc::IFNAMSIZ] {
+    let mut buffer = [0; libc::IFNAMSIZ];
+    for (dst, src) in buffer.iter_mut().take(libc::IFNAMSIZ - 1).zip(name) {
+        *dst = *src as c_char;
+    }
+    buffer
 }
 
 fn metric(list: *mut libc::ifaddrs, name: &[u8]) -> u32 {
@@ -60,64 +111,42 @@ fn request(
     name: &[u8],
     address: &libc::sockaddr_in6,
     code: libc::c_ulong,
-) -> Option<libc::in6_ifreq> {
+) -> io::Result<libc::in6_ifreq> {
     let mut buffer: libc::in6_ifreq = unsafe { std::mem::zeroed() };
-    let length = name.len().min(buffer.ifr_name.len() - 1);
-    for (index, byte) in name[..length].iter().enumerate() {
-        buffer.ifr_name[index] = *byte as c_char;
-    }
+    buffer.ifr_name = interface_name(name);
     buffer.ifr_ifru.ifru_addr = *address;
-    (unsafe { libc::ioctl(socket, code, &mut buffer) } == 0).then_some(buffer)
+    if unsafe { libc::ioctl(socket, code, &mut buffer) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(buffer)
 }
 
 pub fn candidates() -> Result<Vec<Candidate>> {
-    let mut raw = null_mut();
-    if unsafe { libc::getifaddrs(&mut raw) } != 0 {
-        return Err(error("读取网卡 IPv6 失败", std::io::Error::last_os_error()));
-    }
-    let list = IfAddrs(raw);
-    let socket = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
-    if socket < 0 {
-        return Err(error(
-            "打开 IPv6 套接字失败",
-            std::io::Error::last_os_error(),
-        ));
-    }
-
+    let list = IfAddrs::read().map_err(|e| error("读取网卡 IPv6 失败", e))?;
+    let socket = ipv6_socket().map_err(|e| error("打开 IPv6 套接字失败", e))?;
     let mut result = Vec::new();
-    let mut current = list.0;
-    while !current.is_null() {
-        let item = unsafe { &*current };
-        current = item.ifa_next;
-        if item.ifa_addr.is_null()
-            || unsafe { (*item.ifa_addr).sa_family as c_int } != libc::AF_INET6
-            || item.ifa_flags & libc::IFF_UP as u32 == 0
+    for item in list.entries() {
+        let Some(address) = ipv6_of(item) else {
+            continue;
+        };
+        if item.ifa_flags & libc::IFF_UP as u32 == 0
             || item.ifa_flags & libc::IFF_LOOPBACK as u32 != 0
         {
             continue;
         }
-        let address = unsafe { *item.ifa_addr.cast::<libc::sockaddr_in6>() };
         let ip = Ipv6Addr::from(address.sin6_addr.s6_addr);
         if !public_v6(ip) {
             continue;
         }
         let name = name_of(item);
-        let Some(flags) = request(socket, name, &address, libc::SIOCGIFAFLAG_IN6) else {
+        let Ok(flags) = request(socket.as_raw_fd(), name, address, libc::SIOCGIFAFLAG_IN6) else {
             continue;
         };
         let flags = unsafe { flags.ifr_ifru.ifru_flags6 };
-        if flags
-            & (IN6_IFF_ANYCAST
-                | IN6_IFF_TENTATIVE
-                | IN6_IFF_DUPLICATED
-                | IN6_IFF_DETACHED
-                | IN6_IFF_DEPRECATED
-                | IN6_IFF_OPTIMISTIC)
-            != 0
-        {
+        if flags & (UNUSABLE | IN6_IFF_DEPRECATED) != 0 {
             continue;
         }
-        let preferred_lifetime = request(socket, name, &address, SIOCGIFALIFETIME_IN6)
+        let preferred_lifetime = request(socket.as_raw_fd(), name, address, SIOCGIFALIFETIME_IN6)
             .map(|value| unsafe { value.ifr_ifru.ifru_lifetime.ia6t_pltime })
             .unwrap_or(u32::MAX);
         if preferred_lifetime == 0 {
@@ -144,9 +173,6 @@ pub fn candidates() -> Result<Vec<Candidate>> {
             metric,
             preferred_lifetime,
         });
-    }
-    unsafe {
-        libc::close(socket);
     }
     Ok(result)
 }

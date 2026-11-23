@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::net::Ipv6Addr;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -15,6 +16,7 @@ use super::platform;
 use super::{Result, error, network};
 
 const LIMIT: usize = 16 * 1024;
+const SOURCE_INTERVAL: Duration = Duration::from_secs(15);
 type Shared = Arc<Mutex<Engine>>;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -28,6 +30,9 @@ struct Engine {
     config: Option<Config>,
     snapshot: Snapshot,
     due: Option<Instant>,
+    published: Option<Ipv6Addr>,
+    source: network::SourcePreference,
+    source_due: Option<Instant>,
 }
 
 fn now() -> u64 {
@@ -55,6 +60,22 @@ impl Engine {
         Reply { snapshot, error }
     }
 
+    fn reconcile_source(&mut self) {
+        if STOP.load(Ordering::SeqCst) {
+            return;
+        }
+        let target = self.published.filter(|_| {
+            self.config
+                .as_ref()
+                .is_some_and(|config| config.settings.prefer_ddns_source)
+        });
+        let result = self.source.reconcile(target);
+        self.source_due =
+            (target.is_some() || result.is_err()).then(|| Instant::now() + SOURCE_INTERVAL);
+        self.snapshot.source_preference_error =
+            result.err().map(|e| error("调整 IPv6 首选期失败", e));
+    }
+
     fn save(&mut self, settings: Settings, credentials: Credentials) -> Result<()> {
         if self.snapshot.phase == Phase::Running {
             return Err("正在更新，请稍后再试。".into());
@@ -64,7 +85,19 @@ impl Engine {
         if self.config.as_ref() == Some(&config) {
             return Ok(());
         }
+        let only_source_changed = self.config.as_ref().is_some_and(|old| {
+            old.settings.domain == config.settings.domain
+                && old.settings.provider == config.settings.provider
+                && old.settings.address == config.settings.address
+                && old.credentials == config.credentials
+        });
         self.config = Some(config);
+        if only_source_changed {
+            self.reconcile_source();
+            return Ok(());
+        }
+        self.published = None;
+        self.reconcile_source();
         self.snapshot.phase = Phase::Idle;
         self.snapshot.message.clear();
         self.snapshot.address = None;
@@ -97,6 +130,10 @@ fn start_update(engine: &Shared, state: &mut Engine) {
         let mut state = engine.lock().unwrap();
         state.snapshot.address = address;
         state.snapshot.last_run = Some(now());
+        if outcome.is_ok() {
+            state.published = address;
+            state.reconcile_source();
+        }
         let (phase, message, seconds) = match outcome {
             Ok(message) => (Phase::Success, message.to_owned(), INTERVAL),
             Err(message) => (Phase::Failed, message, RETRY),
@@ -223,12 +260,21 @@ pub fn run() -> Result<()> {
             if let Ok(automatic) = platform::automatic() {
                 state.set_automatic(automatic);
             }
+            if state.source_due.is_some_and(|due| Instant::now() >= due) {
+                state.reconcile_source();
+            }
             if state.due.is_some_and(|due| Instant::now() >= due) {
                 start_update(&engine, &mut state);
             }
         }
         thread::sleep(Duration::from_secs(1));
     }
+    engine
+        .lock()
+        .unwrap()
+        .source
+        .reconcile(None)
+        .map_err(|e| error("恢复 IPv6 首选期失败", e))?;
     Ok(())
 }
 

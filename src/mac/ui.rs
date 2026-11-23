@@ -27,7 +27,7 @@ use super::{Result, error, network, platform, service};
 
 const WIDTH: f64 = 486.0;
 const COMPACT_HEIGHT: f64 = 171.0;
-const SETTINGS_HEIGHT: f64 = 526.0;
+const SETTINGS_HEIGHT: f64 = 578.0;
 
 static SHOW: AtomicBool = AtomicBool::new(false);
 
@@ -70,6 +70,8 @@ struct Widgets {
     suffix_label: Retained<NSTextField>,
     suffix: Retained<NSTextField>,
     hint: Retained<NSTextField>,
+    prefer_source: Retained<NSButton>,
+    source_hint: Retained<NSTextField>,
     automatic: Retained<NSButton>,
     uninstall: Retained<NSButton>,
     save: Retained<NSButton>,
@@ -172,7 +174,7 @@ fn checkbox(mtm: MainThreadMarker, title: &str, frame: NSRect) -> Retained<NSBut
 }
 
 fn hide_settings(widgets: &Widgets, expanded: bool, installed: bool) {
-    let views: [&NSView; 17] = [
+    let views: [&NSView; 19] = [
         &widgets.settings_title,
         &widgets.provider_label,
         &widgets.provider,
@@ -188,6 +190,8 @@ fn hide_settings(widgets: &Widgets, expanded: bool, installed: bool) {
         &widgets.suffix_label,
         &widgets.suffix,
         &widgets.hint,
+        &widgets.prefer_source,
+        &widgets.source_hint,
         &widgets.automatic,
         &widgets.save,
     ];
@@ -332,9 +336,15 @@ fn build_widgets(mtm: MainThreadMarker, view: &NSView) -> Widgets {
             false,
             &muted,
         ),
-        automatic: checkbox(mtm, "开机自动更新", rect(32.0, 521.0, 174.0, 32.0)),
-        uninstall: button(mtm, "卸载服务…", rect(231.0, 521.0, 102.0, 32.0)),
-        save: button(mtm, "保存设置", rect(355.0, 521.0, 99.0, 32.0)),
+        prefer_source: checkbox(
+            mtm,
+            "优先使用 DDNS IPv6 作为源地址",
+            rect(32.0, 451.0, 422.0, 25.0),
+        ),
+        source_hint: label(mtm, "", rect(32.0, 480.0, 422.0, 21.0), 11.0, false, &muted),
+        automatic: checkbox(mtm, "开机自动更新", rect(32.0, 527.0, 174.0, 32.0)),
+        uninstall: button(mtm, "卸载服务…", rect(231.0, 527.0, 102.0, 32.0)),
+        save: button(mtm, "保存设置", rect(355.0, 527.0, 99.0, 32.0)),
     };
     if let Some(cell) = widgets.detail.cell() {
         cell.setWraps(true);
@@ -363,6 +373,8 @@ fn build_widgets(mtm: MainThreadMarker, view: &NSView) -> Widgets {
         &widgets.suffix_label,
         &widgets.suffix,
         &widgets.hint,
+        &widgets.prefer_source,
+        &widgets.source_hint,
         &widgets.automatic,
         &widgets.uninstall,
         &widgets.save,
@@ -706,6 +718,7 @@ impl Controller {
                 domain,
                 provider,
                 address,
+                prefer_ddns_source: widgets.prefer_source.state() == NSControlStateValueOn,
             },
             credentials,
             run: false,
@@ -824,6 +837,13 @@ impl Controller {
                     ui.filter = true;
                     text(&widgets.suffix, &suffix.to_string());
                 }
+                widgets
+                    .prefer_source
+                    .setState(if settings.prefer_ddns_source {
+                        NSControlStateValueOn
+                    } else {
+                        NSControlStateValueOff
+                    });
             }
         }
         if let Some(error) = reply.error.clone() {
@@ -1025,14 +1045,20 @@ impl Controller {
             .hint
             .setFrame(rect(32.0, 428.0 + offset, 422.0, 21.0));
         widgets
+            .prefer_source
+            .setFrame(rect(32.0, 451.0 + offset, 422.0, 25.0));
+        widgets
+            .source_hint
+            .setFrame(rect(32.0, 480.0 + offset, 422.0, 21.0));
+        widgets
             .automatic
-            .setFrame(rect(32.0, 475.0 + offset, 174.0, 32.0));
+            .setFrame(rect(32.0, 527.0 + offset, 174.0, 32.0));
         widgets
             .uninstall
-            .setFrame(rect(231.0, 475.0 + offset, 102.0, 32.0));
+            .setFrame(rect(231.0, 527.0 + offset, 102.0, 32.0));
         widgets
             .save
-            .setFrame(rect(355.0, 475.0 + offset, 99.0, 32.0));
+            .setFrame(rect(355.0, 527.0 + offset, 99.0, 32.0));
         title(
             &widgets.run,
             if !installed {
@@ -1059,6 +1085,22 @@ impl Controller {
                 "默认使用稳定的公网 IPv6，跳过临时地址。"
             },
         );
+        let ui = self.ui();
+        let failure = &ui.snapshot.source_preference_error;
+        text(
+            &widgets.source_hint,
+            failure
+                .as_deref()
+                .unwrap_or("影响本机各应用的新 IPv6 连接，首次同步成功后生效。"),
+        );
+        widgets
+            .source_hint
+            .setTextColor(Some(&tone_color(if failure.is_some() {
+                Tone::Error
+            } else {
+                Tone::Muted
+            })));
+        drop(ui);
         let ready = active && phase != Phase::Running;
         let editable = active && (!installed || initialized);
         widgets.host.setEnabled(editable);
@@ -1068,6 +1110,7 @@ impl Controller {
         widgets.secret.setEnabled(editable);
         widgets.filter.setEnabled(editable);
         widgets.suffix.setEnabled(editable && filter);
+        widgets.prefer_source.setEnabled(editable);
         widgets.run.setEnabled(ready && (!installed || initialized));
         widgets.save.setEnabled(installed && initialized && ready);
         widgets.uninstall.setEnabled(installed && active);

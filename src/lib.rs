@@ -153,6 +153,9 @@ pub struct Settings {
     pub provider: Provider,
     #[serde(default)]
     pub address: AddressPolicy,
+    #[cfg(target_os = "macos")]
+    #[serde(default)]
+    pub prefer_ddns_source: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -173,6 +176,9 @@ pub struct Snapshot {
     pub address: Option<Ipv6Addr>,
     pub last_run: Option<u64>,
     pub next_run: Option<u64>,
+    #[cfg(target_os = "macos")]
+    #[serde(default)]
+    pub source_preference_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
