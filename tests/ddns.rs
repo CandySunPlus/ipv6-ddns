@@ -79,7 +79,7 @@ fn loads_legacy_settings_as_stable_mode() {
         .unwrap();
     assert_eq!(settings.domain, "home.example.com");
     assert_eq!(settings.address, AddressPolicy::Stable);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(windows, target_os = "macos"))]
     assert!(!settings.prefer_ddns_source);
 }
 

@@ -1,3 +1,4 @@
+use std::net::Ipv6Addr;
 use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -20,12 +21,14 @@ use windows_sys::Win32::System::Pipes::*;
 use windows_sys::w;
 
 use super::platform::{self, Handle};
+use super::source_preference::SourcePreference;
 use super::{NAME, Result, error, last_error, network};
 
 const PIPE: *const u16 = w!(r"\\.\pipe\IPv6DDNS.v2");
 // File read/write permissions without FILE_CREATE_PIPE_INSTANCE (FILE_APPEND_DATA).
 const CLIENT_ACCESS: u32 = 0x0012_019b;
 const LIMIT: usize = 16 * 1024;
+const SOURCE_INTERVAL: Duration = Duration::from_secs(15);
 type Shared = Arc<Mutex<Engine>>;
 
 #[derive(Default)]
@@ -33,6 +36,9 @@ struct Engine {
     config: Option<Config>,
     snapshot: Snapshot,
     due: Option<Instant>,
+    published: Option<Ipv6Addr>,
+    source: SourcePreference,
+    source_due: Option<Instant>,
 }
 
 fn now() -> u64 {
@@ -60,6 +66,18 @@ impl Engine {
         Reply { snapshot, error }
     }
 
+    fn reconcile_source(&mut self) {
+        let target = self.published.filter(|_| {
+            self.config
+                .as_ref()
+                .is_some_and(|config| config.settings.prefer_ddns_source)
+        });
+        let result = self.source.reconcile(target);
+        self.source_due =
+            (target.is_some() || result.is_err()).then(|| Instant::now() + SOURCE_INTERVAL);
+        self.snapshot.source_preference_error = result.err();
+    }
+
     fn save(&mut self, settings: Settings, credentials: Credentials) -> Result<()> {
         if self.snapshot.phase == Phase::Running {
             return Err("正在更新，请稍后再试。".into());
@@ -69,7 +87,26 @@ impl Engine {
         if self.config.as_ref() == Some(&config) {
             return Ok(());
         }
+        let only_source_changed = self.config.as_ref().is_some_and(|old| {
+            old.settings.domain == config.settings.domain
+                && old.settings.provider == config.settings.provider
+                && old.settings.address == config.settings.address
+                && old.credentials == config.credentials
+        });
+        let enabled = config.settings.prefer_ddns_source;
         self.config = Some(config);
+        if only_source_changed && enabled {
+            self.source_due = Some(Instant::now());
+            return Ok(());
+        }
+        if !only_source_changed {
+            self.published = None;
+        }
+        // Restore before a run can select candidates under the new settings.
+        self.reconcile_source();
+        if only_source_changed {
+            return Ok(());
+        }
         self.snapshot.phase = Phase::Idle;
         self.snapshot.message.clear();
         self.snapshot.address = None;
@@ -102,6 +139,10 @@ fn start_update(engine: &Shared, state: &mut Engine) {
         let mut state = engine.lock().unwrap();
         state.snapshot.address = address;
         state.snapshot.last_run = Some(now());
+        if outcome.is_ok() {
+            state.published = address;
+            state.source_due = Some(Instant::now());
+        }
         let (phase, message, seconds) = match outcome {
             Ok(message) => (Phase::Success, message.to_owned(), INTERVAL),
             Err(message) => (Phase::Failed, message, RETRY),
@@ -158,9 +199,7 @@ fn write_message(pipe: HANDLE, message: &[u8]) -> Result<()> {
 }
 
 fn open_pipe(name: *const u16, owner: &str) -> Result<Handle> {
-    let sd = platform::descriptor(&format!(
-        "D:P(A;;GA;;;SY)(A;;GA;;;LS)(A;;{CLIENT_ACCESS:#x};;;{owner})"
-    ))?;
+    let sd = platform::descriptor(&format!("D:P(A;;GA;;;SY)(A;;{CLIENT_ACCESS:#x};;;{owner})"))?;
     let sa = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: sd.0,
@@ -335,8 +374,14 @@ fn service_main(_arguments: Vec<std::ffi::OsString>) {
             current_state: state,
             controls_accepted: accepted,
             exit_code: exit,
-            checkpoint: u32::from(state == ServiceState::StartPending),
-            wait_hint: if state == ServiceState::StartPending {
+            checkpoint: u32::from(matches!(
+                state,
+                ServiceState::StartPending | ServiceState::StopPending
+            )),
+            wait_hint: if matches!(
+                state,
+                ServiceState::StartPending | ServiceState::StopPending
+            ) {
                 Duration::from_secs(5)
             } else {
                 Duration::ZERO
@@ -378,6 +423,9 @@ fn service_main(_arguments: Vec<std::ffi::OsString>) {
                 if let Ok(automatic) = platform::automatic(&service) {
                     state.set_automatic(automatic);
                 }
+                if state.source_due.is_some_and(|due| Instant::now() >= due) {
+                    state.reconcile_source();
+                }
                 if state.due.is_some_and(|due| Instant::now() >= due) {
                     start_update(&engine, &mut state);
                 }
@@ -386,7 +434,12 @@ fn service_main(_arguments: Vec<std::ffi::OsString>) {
                 break;
             }
         }
-        Ok(())
+        let _ = status(
+            ServiceState::StopPending,
+            ServiceExitCode::NO_ERROR,
+            ServiceControlAccept::empty(),
+        );
+        engine.lock().unwrap().source.reconcile(None)
     })();
     let exit = if result.is_ok() {
         ServiceExitCode::NO_ERROR

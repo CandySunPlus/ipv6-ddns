@@ -2,6 +2,7 @@ mod diagnostics;
 mod network;
 mod platform;
 mod service;
+mod source_preference;
 mod ui;
 
 use std::ffi::OsStr;

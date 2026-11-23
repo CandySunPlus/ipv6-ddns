@@ -385,7 +385,8 @@ pub fn install(owner: &str) -> Result<()> {
             executable_path: path.clone(),
             launch_arguments: vec!["--service".into()],
             dependencies: vec![],
-            account_name: Some(r"NT AUTHORITY\LocalService".into()),
+            // Windows requires administrative privileges to change IPv6 lifetimes.
+            account_name: None, // LocalSystem
             account_password: None,
         };
         let service = manager

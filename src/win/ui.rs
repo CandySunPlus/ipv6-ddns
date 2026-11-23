@@ -70,7 +70,8 @@ const FILTER: usize = ACCESS_SECRET + 1;
 const SUFFIX_LABEL: usize = FILTER + 1;
 const SUFFIX: usize = SUFFIX_LABEL + 1;
 const HINT: usize = SUFFIX + 1;
-const AUTO: usize = HINT + 1;
+const PREFER_SOURCE: usize = HINT + 1;
+const AUTO: usize = PREFER_SOURCE + 1;
 const UNINSTALL: usize = AUTO + 1;
 const SAVE: usize = UNINSTALL + 1;
 const WIDGET_COUNT: usize = SAVE + 1;
@@ -125,9 +126,15 @@ const WIDGETS: &[(usize, Kind, &str, [i32; 4])] = &[
     (SUFFIX_LABEL, Label, "IPv6 后缀", [32, 441, 422, 19]),
     (SUFFIX, Edit, "", [32, 462, 422, 31]),
     (HINT, Label, "默认使用稳定的公网 IPv6。", [32, 501, 422, 21]),
-    (AUTO, Check, "开机自动更新", [32, 527, 174, 32]),
-    (UNINSTALL, Button, "卸载服务…", [231, 527, 102, 32]),
-    (SAVE, Button, "保存设置", [355, 527, 99, 32]),
+    (
+        PREFER_SOURCE,
+        Check,
+        "优先使用 DDNS IPv6 作为源地址",
+        [32, 526, 422, 25],
+    ),
+    (AUTO, Check, "开机自动更新", [32, 555, 174, 32]),
+    (UNINSTALL, Button, "卸载服务…", [231, 555, 102, 32]),
+    (SAVE, Button, "保存设置", [355, 555, 99, 32]),
 ];
 
 #[derive(Clone, Copy)]
@@ -168,6 +175,7 @@ struct Ui {
     initialized: bool,
     expanded: bool,
     filter: bool,
+    prefer_source: bool,
     provider: Provider,
     draft_changed: bool,
     pending: Option<Work>,
@@ -207,7 +215,7 @@ fn scale(pixels: i32, dpi: u32) -> i32 {
 }
 
 fn settings_height(provider: Provider) -> i32 {
-    578 + if provider == Provider::Aliyun { 66 } else { 0 }
+    606 + if provider == Provider::Aliyun { 66 } else { 0 }
 }
 
 fn window_size(dpi: u32, expanded: bool, provider: Provider) -> (i32, i32) {
@@ -386,6 +394,7 @@ impl Ui {
             initialized: false,
             expanded: false,
             filter: false,
+            prefer_source: false,
             provider: Provider::default(),
             draft_changed: false,
             pending: None,
@@ -687,6 +696,11 @@ impl Ui {
                     }
                 }
             }
+            PREFER_SOURCE => {
+                self.prefer_source = !self.prefer_source;
+                self.draft_changed = true;
+                self.render();
+            }
             RUN if !self.installed => self.work(Work::Install, None),
             RUN => {
                 if self.snapshot.settings.is_some() {
@@ -731,6 +745,7 @@ impl Ui {
                         domain,
                         provider: self.provider,
                         address,
+                        prefer_ddns_source: self.prefer_source,
                     },
                     credentials,
                     run: false,
@@ -864,6 +879,7 @@ impl Ui {
             if !self.draft_changed {
                 if let Some(settings) = &reply.snapshot.settings {
                     self.provider = settings.provider;
+                    self.prefer_source = settings.prefer_ddns_source;
                     unsafe {
                         SendMessageW(
                             self.widgets[PROVIDER],
@@ -906,12 +922,8 @@ impl Ui {
         if let Some(message) = &self.connection_issue {
             return ("服务连接失败", message, ERROR);
         }
-        if let Some((is_error, message)) = &self.notice {
-            return if *is_error {
-                ("需要处理", message, ERROR)
-            } else {
-                ("已保存", message, SUCCESS)
-            };
+        if let Some((true, message)) = &self.notice {
+            return ("需要处理", message, ERROR);
         }
         if matches!(
             self.pending,
@@ -928,6 +940,14 @@ impl Ui {
         }
         if !self.initialized {
             return ("正在连接服务", "正在读取本机的 DDNS 状态。", ACCENT);
+        }
+        if self.snapshot.phase != Phase::Failed
+            && let Some(message) = &self.snapshot.source_preference_error
+        {
+            return ("源地址优先设置失败", message, ERROR);
+        }
+        if let Some((false, message)) = &self.notice {
+            return ("已保存", message, SUCCESS);
         }
         match self.snapshot.phase {
             Phase::Idle if self.snapshot.settings.is_none() => {
@@ -1041,7 +1061,15 @@ impl Ui {
                     },
                 );
             }
-            for id in [PROVIDER, HOST, TOKEN, ACCESS_ID, ACCESS_SECRET, FILTER] {
+            for id in [
+                PROVIDER,
+                HOST,
+                TOKEN,
+                ACCESS_ID,
+                ACCESS_SECRET,
+                FILTER,
+                PREFER_SOURCE,
+            ] {
                 EnableWindow(self.widgets[id], i32::from(active));
             }
             EnableWindow(self.widgets[SUFFIX], i32::from(active && self.filter));
@@ -1072,6 +1100,16 @@ impl Ui {
                 self.widgets[FILTER],
                 BM_SETCHECK,
                 if self.filter {
+                    BST_CHECKED
+                } else {
+                    BST_UNCHECKED
+                } as usize,
+                0,
+            );
+            SendMessageW(
+                self.widgets[PREFER_SOURCE],
+                BM_SETCHECK,
+                if self.prefer_source {
                     BST_CHECKED
                 } else {
                     BST_UNCHECKED
